@@ -1212,6 +1212,11 @@ void CombatBotBaseAI::PopulateSpellData()
                     if (IsHigherRankSpell(m_spells.warrior.pSunderArmor))
                         m_spells.warrior.pSunderArmor = pSpellEntry;
                 }
+                else if (pSpellEntry->SpellName[0] == "Revenge") // not "Revenge Stun"
+                {
+                    if (IsHigherRankSpell(m_spells.warrior.pRevenge))
+                        m_spells.warrior.pRevenge = pSpellEntry;
+                }
                 else if (pSpellEntry->SpellName[0].find("Concussion Blow") != std::string::npos)
                 {
                     if (IsHigherRankSpell(m_spells.warrior.pConcussionBlow))
@@ -3174,7 +3179,9 @@ bool CombatBotBaseAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* p
     if (pSpellEntry->GetErrorAtShapeshiftedCast(me->GetShapeshiftForm()) != SPELL_CAST_OK)
         return false;
 
-    if (pSpellEntry->IsSpellAppliesAura() && pTarget->HasAura(pSpellEntry->Id))
+    // Stacking warrior debuffs (Sunder Armor): the caller decides on stacks and refresh.
+    if (pSpellEntry->IsSpellAppliesAura() && pTarget->HasAura(pSpellEntry->Id) &&
+       !(pSpellEntry->SpellFamilyName == SPELLFAMILY_WARRIOR && pSpellEntry->GetStackAmount() > 1))
         return false;
 
     SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex);

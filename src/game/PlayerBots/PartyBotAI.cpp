@@ -53,7 +53,8 @@ enum PartyBotSpells
 #define PB_AUTO_AOE_RADIUS 10.0f
 #define PB_TANK_SAFE_LEAD 1.5f       // tank threat >= this x anyone else's = enemy is safe
 #define PB_TANK_DANGER_LEAD 1.15f    // tank threat below this x someone else's = about to switch
-#define PB_TANK_THREAT_FLOOR 10.0f   // per tank level: threat counted as "anyone else" at minimum
+#define PB_TANK_THREAT_FLOOR 10.0f
+#define PB_SUNDER_REFRESH_MS 5000    // re-apply a full Sunder Armor stack with this much time left   // per tank level: threat counted as "anyone else" at minimum
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -3437,6 +3438,14 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
             }
         }
 
+        // Revenge: Defensive Stance, after a block/dodge/parry (aura state checked by the cast rules).
+        if (m_spells.warrior.pRevenge &&
+            CanTryToCastSpell(pVictim, m_spells.warrior.pRevenge))
+        {
+            if (DoCastSpell(pVictim, m_spells.warrior.pRevenge) == SPELL_CAST_OK)
+                return;
+        }
+
         if (m_spells.warrior.pThunderClap &&
             m_role == ROLE_TANK &&
             CanTryToCastSpell(pVictim, m_spells.warrior.pThunderClap))
@@ -3445,12 +3454,30 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
                 return;
         }
 
-        if (m_spells.warrior.pSunderArmor &&
-            m_role == ROLE_TANK &&
-            CanTryToCastSpell(pVictim, m_spells.warrior.pSunderArmor))
+        // Sunder Armor: stack to the maximum (5), then refresh shortly before it runs out.
+        if (m_spells.warrior.pSunderArmor && m_role == ROLE_TANK)
         {
-            if (DoCastSpell(pVictim, m_spells.warrior.pSunderArmor) == SPELL_CAST_OK)
+            uint32 stacks = 0;
+            int32 remaining = 0;
+            if (SpellAuraHolder const* pHolder = pVictim->GetSpellAuraHolder(m_spells.warrior.pSunderArmor->Id))
+            {
+                stacks = pHolder->GetStackAmount();
+                remaining = pHolder->GetAuraDuration();
+            }
+            uint32 const maxStacks = std::max<uint32>(1, m_spells.warrior.pSunderArmor->GetStackAmount());
+
+            if ((stacks < maxStacks || remaining < PB_SUNDER_REFRESH_MS) &&
+                CanTryToCastSpell(pVictim, m_spells.warrior.pSunderArmor) &&
+                DoCastSpell(pVictim, m_spells.warrior.pSunderArmor) == SPELL_CAST_OK)
+            {
+                if (stacks < maxStacks)
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, stack %u/%u",
+                        me->GetName(), pVictim->GetName(), stacks + 1, maxStacks);
+                else
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, refresh %u/%u (%.1f s left)",
+                        me->GetName(), pVictim->GetName(), stacks, maxStacks, remaining / 1000.0f);
                 return;
+            }
         }
 
         if (m_spells.warrior.pHamstring &&
