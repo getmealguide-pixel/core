@@ -51,6 +51,10 @@ enum PartyBotSpells
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
 #define PB_AUTO_AOE_MIN_TARGETS 4    // auto AoE when more than 3 enemies stand around the target
 #define PB_AUTO_AOE_RADIUS 10.0f
+#define PB_AOE_DAMAGE_SAFETY 1.5f    // AoE aggro check: estimated spell damage x this (spell power, crits)
+#define PB_TANK_SAFE_LEAD 1.5f       // tank threat >= this x anyone else's = enemy is safe
+#define PB_TANK_DANGER_LEAD 1.15f    // tank threat below this x someone else's = about to switch
+#define PB_TANK_THREAT_FLOOR 10.0f   // per tank level: threat counted as "anyone else" at minimum
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -283,6 +287,51 @@ bool PartyBotAI::ShouldAutoRevive() const
     return alivePlayerNearby;
 }
 
+// Rough damage one target takes from a hostile spell over its whole duration (direct hits,
+// damage over time, triggered spells, weapon strikes). Bonus damage is not included; callers
+// add a safety factor. Never 0 (unknown spells count as 10 per caster level).
+float PartyBotAI::EstimateSpellDamage(SpellEntry const* pSpellEntry, uint8 depth) const
+{
+    float total = 0.0f;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        float const value = float(std::max(0, pSpellEntry->CalculateSimpleValue(SpellEffectIndex(i))));
+        int32 const ticks = pSpellEntry->EffectAmplitude[i] ?
+            std::max(1, pSpellEntry->GetDuration() / int32(pSpellEntry->EffectAmplitude[i])) : 1;
+        SpellEntry const* pTriggered = (depth < 2 && pSpellEntry->EffectTriggerSpell[i]) ?
+            sSpellMgr.GetSpellEntry(pSpellEntry->EffectTriggerSpell[i]) : nullptr;
+
+        switch (pSpellEntry->Effect[i])
+        {
+            case SPELL_EFFECT_SCHOOL_DAMAGE:
+                total += value;
+                break;
+            case SPELL_EFFECT_WEAPON_DAMAGE:
+            case SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL:
+            case SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
+            case SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
+                total += value + std::max(me->GetFloatValue(UNIT_FIELD_MAXDAMAGE),
+                                          me->GetFloatValue(UNIT_FIELD_MAXRANGEDDAMAGE));
+                break;
+            case SPELL_EFFECT_TRIGGER_SPELL:
+                if (pTriggered)
+                    total += EstimateSpellDamage(pTriggered, depth + 1);
+                break;
+            case SPELL_EFFECT_APPLY_AURA:
+            case SPELL_EFFECT_PERSISTENT_AREA_AURA:
+                if (pSpellEntry->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE)
+                    total += value * ticks;
+                else if (pSpellEntry->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_TRIGGER_SPELL && pTriggered)
+                    total += EstimateSpellDamage(pTriggered, depth + 1) * ticks;
+                break;
+        }
+    }
+
+    if (depth == 0 && total <= 0.0f)
+        total = me->GetLevel() * 10.0f;
+    return total;
+}
+
 bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpellEntry) const
 {
     if (!CombatBotBaseAI::CanTryToCastSpell(pTarget, pSpellEntry))
@@ -308,7 +357,7 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
         if (!m_marksToCC.empty())
             return false;
 
-        // do not cast aoe if it will pull aggro
+        // Do not cast AoE if it would pull aggro (tanks excepted).
         if (m_role != ROLE_TANK)
         {
             float radius;
@@ -321,23 +370,41 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
             else
                 radius = 10.0f;
 
+            // Self-centred spells (Arcane Explosion, Whirlwind) hit around the caster.
+            Unit const* pCenter = pSpellEntry->rangeIndex == SPELL_RANGE_IDX_SELF_ONLY ? me : pTarget;
+            float const burst = EstimateSpellDamage(pSpellEntry) * PB_AOE_DAMAGE_SAFETY;
+
             std::list<Unit*> targets;
-            me->GetEnemyListInRadiusAround(pTarget, radius, targets);
+            me->GetEnemyListInRadiusAround(pCenter, radius, targets);
 
             for (auto const& pEnemy : targets)
             {
-                if (((pEnemy->GetLevel() + 5) > me->GetLevel()) &&
-                    ((pEnemy->GetHealth() * 4) > me->GetHealth()) &&
-                    pEnemy->GetVictim() && pEnemy->GetVictim() != me &&
-                    pEnemy->IsValidAttackTarget(me) &&
-                    pEnemy->CanHaveThreatList())
-                {
-                    float const myThreat = pEnemy->GetThreatManager().getThreat(me);
-                    float const victimThreat = pEnemy->GetThreatManager().getThreat(pEnemy->GetVictim());
+                // Never break crowd control.
+                if (pEnemy->HasBreakableByDamageCrowdControlAura())
+                    return false;
 
-                    if (victimThreat < (myThreat + me->GetMaxHealth()))
-                        return false;
-                }
+                // Weak enemies do not matter.
+                if ((pEnemy->GetLevel() + 5) <= me->GetLevel() ||
+                    (pEnemy->GetHealth() * 4) <= me->GetHealth() ||
+                    !pEnemy->IsValidAttackTarget(me))
+                    continue;
+
+                // Never pull a pack that is not fighting yet.
+                if (!pEnemy->IsInCombat())
+                    return false;
+
+                Unit* pEnemyVictim = pEnemy->GetVictim();
+                if (!pEnemyVictim || pEnemyVictim == me || !pEnemy->CanHaveThreatList())
+                    continue;
+
+                // Real aggro rule: an enemy switches at 110% of its victim's threat in melee
+                // range, 130% at range. Count this spell's whole damage on top of my threat.
+                float const myThreat = pEnemy->GetThreatManager().getThreat(me);
+                float const victimThreat = pEnemy->GetThreatManager().getThreat(pEnemyVictim);
+                float const pullFactor = pEnemy->CanReachWithMeleeAutoAttack(me) ? 1.1f : 1.3f;
+
+                if (myThreat + burst >= victimThreat * pullFactor)
+                    return false;
             }
         }
     }
@@ -855,13 +922,27 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     if (m_holdPosition && ReturnToHoldSpot())
         return;
 
+    // The group is fighting (a member within 50 yd is attacked) but this bot is not hit yet:
+    // it joins the fight or heals instead of sitting down or buffing; a sitting bot stands up.
+    bool const groupFighting = !me->IsInCombat() && !IsInDuel() && SelectPartyAttackTarget();
+
     if (!me->IsInCombat())
     {
+        if (groupFighting && (me->HasAura(PB_SPELL_FOOD) || me->HasAura(PB_SPELL_DRINK)))
+        {
+            me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
+            me->RemoveAurasDueToSpell(PB_SPELL_DRINK);
+            if (me->GetStandState() != UNIT_STAND_STATE_STAND)
+                me->SetStandState(UNIT_STAND_STATE_STAND);
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: stops eating/drinking, the group is fighting",
+                me->GetName());
+        }
+
         // On stay: eat/drink freely. Otherwise following wins: only once near the leader
         // (stacked: on the leader) and while the leader stands still.
-        bool const mayEatDrink = !mayFollow ||
+        bool const mayEatDrink = !groupFighting && (!mayFollow ||
             (!pLeader->IsMoving() &&
-              me->IsWithinDist(pLeader, stackedFollow ? PB_STACK_DIST : PB_MAX_FOLLOW_DIST + 2.0f, true, SizeFactor::None));
+              me->IsWithinDist(pLeader, stackedFollow ? PB_STACK_DIST : PB_MAX_FOLLOW_DIST + 2.0f, true, SizeFactor::None)));
         if (mayEatDrink && DrinkAndEat())
         {
             if (!me->IsWithinDistInMap(pLeader, 100.0f))
@@ -895,7 +976,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     if (me->GetSheath() == SHEATH_STATE_UNARMED && !me->IsMounted())
         me->SetSheath(SHEATH_STATE_MELEE);
 
-    if (!me->IsInCombat() && !me->IsMounted())
+    // Not while the group fights: damage dealers and tanks go straight to target selection
+    // (healers keep this, their out-of-combat code heals the members that are being hit).
+    if (!me->IsInCombat() && !me->IsMounted() && (!groupFighting || GetRole() == ROLE_HEALER))
     {
         // Buffs and other instant spells always go out. While the leader moves (not on stay)
         // cast-time spells are refused (CanTryToCastSpell) and the bot keeps following instead
@@ -1730,9 +1813,88 @@ bool PartyBotAI::TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, 
     return false;
 }
 
+// Tank threat on an enemy divided by the highest threat anyone else has on it. withFloor: that
+// highest threat is at least a level-based floor, so an enemy nobody else hit yet is not safe
+// until the tank built some; without it the lead shows real danger (an enemy about to switch).
+float PartyBotAI::GetThreatLead(Unit* pEnemy, bool withFloor) const
+{
+    if (!pEnemy->CanHaveThreatList())
+        return 100.0f;
+
+    float myThreat = 0.0f;
+    float othersMax = withFloor ? me->GetLevel() * PB_TANK_THREAT_FLOOR : 0.0f;
+    for (auto const* pRef : pEnemy->GetThreatManager().getThreatList())
+    {
+        if (pRef->getUnitGuid() == me->GetObjectGuid())
+            myThreat = pRef->getThreat();
+        else
+            othersMax = std::max(othersMax, pRef->getThreat());
+    }
+    if (othersMax <= 0.0f)
+        return 100.0f;
+    return myThreat / othersMax;
+}
+
+// Tab-tanking over the enemies attacking this tank (in melee reach):
+// - an enemy about to be pulled by someone else (real lead < 1.15) gets the tank at once,
+//   unless the current target is in the same danger;
+// - otherwise, once the current target is safe (lead >= 1.5), the tank moves to the least
+//   safe enemy. It keeps hitting a target until it is safe, so it rotates over the pack and
+//   comes back to the one the damage dealers focus. Returns the (new) victim.
+Unit* PartyBotAI::TabForThreat(Unit* pVictim)
+{
+    if (!pVictim || pVictim->GetVictim() != me)
+        return pVictim;
+
+    bool const victimSafe = GetThreatLead(pVictim, true) >= PB_TANK_SAFE_LEAD;
+    bool const victimInDanger = GetThreatLead(pVictim, false) < PB_TANK_DANGER_LEAD;
+
+    Unit* pBest = nullptr;
+    float bestLead = PB_TANK_SAFE_LEAD;
+    bool bestInDanger = false;
+    for (auto const pAttacker : me->GetAttackers())
+    {
+        if (pAttacker == pVictim || pAttacker->GetVictim() != me ||
+           !IsValidHostileTarget(pAttacker) ||
+            pAttacker->HasBreakableByDamageCrowdControlAura() ||
+           !me->CanReachWithMeleeAutoAttack(pAttacker))
+            continue;
+
+        float const realLead = GetThreatLead(pAttacker, false);
+        if (realLead < PB_TANK_DANGER_LEAD)
+        {
+            if (!victimInDanger && (!bestInDanger || realLead < bestLead))
+            {
+                pBest = pAttacker;
+                bestLead = realLead;
+                bestInDanger = true;
+            }
+            continue;
+        }
+
+        float const lead = GetThreatLead(pAttacker, true);
+        if (victimSafe && !bestInDanger && lead < bestLead)
+        {
+            pBest = pAttacker;
+            bestLead = lead;
+        }
+    }
+
+    if (!pBest)
+        return pVictim;
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: leaves %s, builds threat on %s (lead %.2f%s)",
+        me->GetName(), pVictim->GetName(), pBest->GetName(), bestLead, bestInDanger ? ", about to be pulled" : "");
+    me->AttackStop(true);
+    AttackStart(pBest);
+    return pBest;
+}
+
 // Tank role duty. Focus mark + single focus: only the mark. Focus mark: the mark, plus
 // taunting loose enemies while the mark is on us. No mark: grab every loose enemy, except a
 // main tank that has off-tanks (it holds the main target and leaves adds to them).
+// Without single focus the tank also builds threat on every enemy hitting it (TabForThreat),
+// returning to the mark whenever someone is about to pull it.
 bool PartyBotAI::UpdateTankDuty()
 {
     PartyBotTankSlotMap const& slots = GetTankSlots();
@@ -1753,7 +1915,13 @@ bool PartyBotAI::UpdateTankDuty()
 
     if (Unit* pMark = GetFocusMarkTarget())
     {
-        if (pVictim != pMark)
+        // Away from the mark to build threat: allowed while the mark is on us and nobody is
+        // about to pull it (tabbing away itself needs the mark safe, see TabForThreat).
+        bool const tabbedAway = !m_singleFocus && pVictim && pVictim != pMark &&
+            pVictim->GetVictim() == me && IsValidHostileTarget(pVictim) &&
+            pMark->GetVictim() == me && GetThreatLead(pMark, false) >= PB_TANK_DANGER_LEAD;
+
+        if (pVictim != pMark && !tabbedAway)
         {
             me->AttackStop(true);
             AttackStart(pMark);
@@ -1761,9 +1929,13 @@ bool PartyBotAI::UpdateTankDuty()
         }
 
         if (!m_singleFocus && pMark->GetVictim() == me)
+        {
             if (Unit* pLoose = SelectLooseEnemy(slots))
                 if (TauntIfAllowed(pLoose, slots, otherTanks))
                     return true;
+
+            TabForThreat(pVictim);
+        }
 
         return TauntIfAllowed(pMark, slots, otherTanks);
     }
@@ -1788,6 +1960,8 @@ bool PartyBotAI::UpdateTankDuty()
 
     if (!pVictim)
         return false;
+
+    pVictim = TabForThreat(pVictim);
 
     return TauntIfAllowed(pVictim, slots, otherTanks);
 }

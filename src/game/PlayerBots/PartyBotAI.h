@@ -134,6 +134,11 @@ public:
     Unit* SelectLooseEnemy(PartyBotTankSlotMap const& slots) const;
     bool TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks);
     bool UpdateTankDuty();
+    // Threat on every enemy: threat lead on an enemy, and switching to the least safe enemy
+    // on this tank once the current target is safe (tab-tanking).
+    float GetThreatLead(Unit* pEnemy, bool withFloor) const;
+    Unit* TabForThreat(Unit* pVictim);
+    float EstimateSpellDamage(SpellEntry const* pSpellEntry, uint8 depth = 0) const;
 
     // Ding sync (temporary .partybot add bots only): match the leader's level, then learn
     // trainer spells and talents of the bot's role.
