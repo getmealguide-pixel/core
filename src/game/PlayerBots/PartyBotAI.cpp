@@ -173,6 +173,9 @@ Unit* PartyBotAI::GetDistancingTarget(Unit* pEnemy)
 
 bool PartyBotAI::RunAwayFromTarget(Unit* pEnemy)
 {
+    if (!CanMoveOnOwn())
+        return false;
+
     if (Unit* pTarget = GetDistancingTarget(pEnemy))
     {
         me->MonsterMove(pTarget->GetPositionX(), pTarget->GetPositionY(), pTarget->GetPositionZ());
@@ -268,6 +271,11 @@ bool PartyBotAI::ShouldAutoRevive() const
 bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpellEntry) const
 {
     if (!CombatBotBaseAI::CanTryToCastSpell(pTarget, pSpellEntry))
+        return false;
+
+    // Holding position: no spells that move the caster (Charge, Intercept, Feral Charge, Blink).
+    if (!CanMoveOnOwn() &&
+       (pSpellEntry->HasEffect(SPELL_EFFECT_CHARGE) || pSpellEntry->HasEffect(SPELL_EFFECT_LEAP)))
         return false;
 
     if (pSpellEntry->IsAreaOfEffectSpell() && !pSpellEntry->IsPositiveSpell() && !IsInDuel())
@@ -789,6 +797,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     if (me->GetTargetGuid() == me->GetObjectGuid())
         me->ClearTarget();
 
+    SetActiveLayer(SelectLayer());
+    bool const mayFollow = m_activeLayer != PB_LAYER_COMMAND;
+
     if (!me->IsInCombat())
     {
         if (DrinkAndEat())
@@ -805,7 +816,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         }
 
         // Teleport to leader if too far away.
-        if (!me->IsWithinDistInMap(pLeader, 100.0f) && !IsInDuel())
+        if (mayFollow && !me->IsWithinDistInMap(pLeader, 100.0f) && !IsInDuel())
         {
             if (!me->IsStopped())
                 me->StopMoving();
@@ -852,7 +863,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         }
     }
 
-    if (!me->IsInCombat())
+    if (mayFollow && !me->IsInCombat())
     {
         // Mount if leader is mounted and we don't have a target.
         if (pLeader->IsMounted() && !me->GetVictim())
@@ -886,7 +897,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     {
         if (!pVictim)
         {
-            if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+            if (mayFollow && me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
                 me->GetMotionMaster()->MoveFollow(pLeader, urand(PB_MIN_FOLLOW_DIST, PB_MAX_FOLLOW_DIST), frand(PB_MIN_FOLLOW_ANGLE, PB_MAX_FOLLOW_ANGLE));
         }
         else
@@ -911,6 +922,54 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         UpdateInCombatAI();
 }
 
+
+PartyBotLayer PartyBotAI::SelectLayer() const
+{
+    if (m_holdPosition)
+        return PB_LAYER_COMMAND;
+
+    if (me->IsInCombat() || me->GetVictim())
+        return PB_LAYER_ROLE_DUTY;
+
+    return PB_LAYER_FOLLOW;
+}
+
+static char const* GetPartyBotLayerName(PartyBotLayer layer)
+{
+    switch (layer)
+    {
+        case PB_LAYER_COMMAND:
+            return "Command(stay)";
+        case PB_LAYER_ROLE_DUTY:
+            return "RoleDuty";
+        case PB_LAYER_FOLLOW:
+            return "Follow";
+        default:
+            return "None";
+    }
+}
+
+void PartyBotAI::SetActiveLayer(PartyBotLayer layer)
+{
+    if (layer == m_activeLayer)
+        return;
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %s -> %s", me->GetName(),
+        GetPartyBotLayerName(m_activeLayer), GetPartyBotLayerName(layer));
+    m_activeLayer = layer;
+}
+
+void PartyBotAI::SetHoldPosition(bool hold)
+{
+    m_holdPosition = hold;
+
+    if (hold)
+    {
+        me->StopMoving();
+        me->GetMotionMaster()->Clear(false, true);
+        me->GetMotionMaster()->MoveIdle();
+    }
+}
 
 void PartyBotAI::UpdateOutOfCombatAI()
 {

@@ -3022,6 +3022,9 @@ void CombatBotBaseAI::UpdateVisualHonorRankBasedOnItems()
 
 void CombatBotBaseAI::BeginChasing(Unit* pVictim) const
 {
+    if (!CanMoveOnOwn())
+        return;
+
     if ((m_role == ROLE_RANGE_DPS || m_role == ROLE_HEALER) &&
         IsRangedDamageClass(me->GetClass()) &&
        !IsAttackSpeedOverridenForm(me->GetShapeshiftForm()) &&

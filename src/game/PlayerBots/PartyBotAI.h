@@ -21,6 +21,17 @@
 #include "Group.h"
 #include "ObjectAccessor.h"
 
+// Brain layers, highest priority first. Each update the top layer that wants control
+// becomes active; higher layers may also restrict lower ones (e.g. "stay" forbids movement
+// while role duty still heals and fights).
+enum PartyBotLayer : uint8
+{
+    PB_LAYER_NONE,
+    PB_LAYER_COMMAND,   // player orders (stay)
+    PB_LAYER_ROLE_DUTY, // class/role logic: tank, heal, dps
+    PB_LAYER_FOLLOW,    // follow the leader
+};
+
 class PartyBotAI : public CombatBotBaseAI
 {
 public:
@@ -68,6 +79,11 @@ public:
     bool ShouldEnterStealth() const;
     bool EnterStealthIfNeeded(SpellEntry const* pStealthSpell);
 
+    PartyBotLayer SelectLayer() const;
+    void SetActiveLayer(PartyBotLayer layer);
+    void SetHoldPosition(bool hold);
+    bool CanMoveOnOwn() const final { return !m_holdPosition; }
+
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
     void UpdateOutOfCombatAI() final;
@@ -105,6 +121,8 @@ public:
     float m_z = 0.0f;
     float m_o = 0.0f;
     bool m_resetSpellData = false;
+    bool m_holdPosition = false;
+    PartyBotLayer m_activeLayer = PB_LAYER_NONE;
 };
 
 #endif

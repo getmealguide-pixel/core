@@ -723,6 +723,11 @@ DebuffLimit = 0
 #        Default: "Network.log"
 #                 "" - Empty name for disable
 #
+#    LogFile.PlayerBots
+#        Log file of party bot decisions (brain layer switches)
+#        Default: "PlayerBots.log"
+#                 "" - Empty name for disable
+#
 #    CharLogDump
 #        Write character dump before deleting in Char.log
 #        For restoration, cut character data from log starting from
@@ -877,6 +882,7 @@ LogFile.Gm = ""
 LogFile.GmCriticalCommands = "gm_critical.log"
 LogFile.Trades = "Trades.log"
 LogFile.Network = "Network.log"
+LogFile.PlayerBots = "PlayerBots.log"
 
 LogMoneyThreshold = 10000
 CharLogDump = 0

@@ -1519,6 +1519,8 @@ bool HandlePartyBotComeToMeHelper(Player* pBot, Player* pPlayer)
     {
         if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pBot->AI()))
         {
+            pAI->SetHoldPosition(false);
+
             if (pBot->GetVictim())
                 StopPartyBotAttackHelper(pAI, pBot);
 
@@ -1743,6 +1745,86 @@ bool ChatHandler::HandlePartyBotPauseCommand(char* args)
 bool ChatHandler::HandlePartyBotUnpauseCommand(char* args)
 {
     return HandlePartyBotPauseHelper(args, false);
+}
+
+bool HandlePartyBotHoldApplyHelper(Player* pTarget, bool hold)
+{
+    if (pTarget->AI())
+    {
+        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        {
+            pAI->SetHoldPosition(hold);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ChatHandler::HandlePartyBotHoldHelper(char* args, bool hold)
+{
+    bool all = false;
+    if (char* arg1 = ExtractArg(&args))
+        all = strcmp(arg1, "all") == 0;
+
+    char const* const order = hold ? "holding position" : "following";
+
+    if (all)
+    {
+        Player* pPlayer = GetSession()->GetPlayer();
+        Group* pGroup = pPlayer->GetGroup();
+        if (!pGroup)
+        {
+            SendSysMessage("You are not in a group.");
+            SetSentErrorMessage(true);
+            return false;
+        }
+
+        bool success = false;
+        for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+        {
+            if (Player* pMember = itr->getSource())
+            {
+                if (pMember == pPlayer)
+                    continue;
+
+                if (HandlePartyBotHoldApplyHelper(pMember, hold))
+                    success = true;
+            }
+        }
+
+        if (success)
+            PSendSysMessage("All party bots %s.", order);
+        else
+            SendSysMessage("No party bots in group.");
+    }
+    else
+    {
+        Player* pTarget = GetSelectedPlayer();
+        if (!pTarget)
+        {
+            SendSysMessage(LANG_NO_CHAR_SELECTED);
+            SetSentErrorMessage(true);
+            return false;
+        }
+
+        if (HandlePartyBotHoldApplyHelper(pTarget, hold))
+            PSendSysMessage("%s %s.", pTarget->GetName(), order);
+        else
+            SendSysMessage("Target is not a party bot.");
+    }
+
+    return true;
+}
+
+bool ChatHandler::HandlePartyBotStayCommand(char* args)
+{
+    return HandlePartyBotHoldHelper(args, true);
+}
+
+bool ChatHandler::HandlePartyBotFollowCommand(char* args)
+{
+    return HandlePartyBotHoldHelper(args, false);
 }
 
 bool ChatHandler::HandlePartyBotPullCommand(char* args)

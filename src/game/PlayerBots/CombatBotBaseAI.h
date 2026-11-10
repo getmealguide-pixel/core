@@ -134,6 +134,8 @@ public:
     uint8 GetHighestHonorRankFromEquippedItems() const;
     void UpdateVisualHonorRankBasedOnItems();
     void BeginChasing(Unit* pVictim) const;
+    // False while a higher-priority order (e.g. "stay") forbids the bot from moving on its own.
+    virtual bool CanMoveOnOwn() const { return true; }
     bool SummonShamanTotems();
     SpellCastResult CastWeaponBuff(SpellEntry const* pSpellEntry, EquipmentSlots slot);
     bool UseTrinketEffects(bool onlyToBreakCC = false);

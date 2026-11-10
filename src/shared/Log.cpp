@@ -118,6 +118,7 @@ void Log::OpenWorldLogFiles()
     logFiles[LOG_SCRIPTS] = OpenLogFile("LogFile.Scripts", "Scripts.log", log_file_timestamp, false);
     logFiles[LOG_MOVEMENT] = OpenLogFile("LogFile.Movement", "Movement.log", log_file_timestamp, false);
     logFiles[LOG_NETWORK] = OpenLogFile("LogFile.Network", "Network.log", log_file_timestamp, false);
+    logFiles[LOG_PLAYERBOTS] = OpenLogFile("LogFile.PlayerBots", "PlayerBots.log", log_file_timestamp, false);
 }
 
 void Log::InitSmartlogEntries(std::string const& str)

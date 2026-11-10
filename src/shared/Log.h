@@ -145,6 +145,7 @@ enum LogType
     LOG_SCRIPTS,
     LOG_MOVEMENT,
     LOG_NETWORK,
+    LOG_PLAYERBOTS,
     LOG_TYPE_MAX
 };
 

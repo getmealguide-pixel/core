@@ -22507,6 +22507,7 @@ static char const* type_strings[] =
     "Scripts",
     "Movement",
     "Network",
+    "PlayerBots",
 };
 
 static_assert(sizeof(type_strings) / sizeof(type_strings[0]) == LOG_TYPE_MAX, "type_strings must be updated");
