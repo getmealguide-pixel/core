@@ -1822,11 +1822,12 @@ Unit* PartyBotAI::TabForThreat(Unit* pVictim)
     return pBest;
 }
 
-// Tank role duty. Focus mark + single focus: only the mark. Focus mark: the mark, plus
-// taunting loose enemies while the mark is on us. No mark: grab every loose enemy, except a
-// main tank that has off-tanks (it holds the main target and leaves adds to them).
-// Without single focus the tank also builds threat on every enemy hitting it (TabForThreat),
-// returning to the mark whenever someone is about to pull it.
+// Tank role duty.
+// - Focus mark + single focus: only the mark (raids).
+// - Otherwise the tank always goes for loose enemies (attacking a group member without a tank
+//   slot): it switches to them, taunts and builds threat. With a focus mark it leaves the mark
+//   only while it holds the mark (mark on us, nobody about to pull it) and returns otherwise.
+// - Between loose enemies it builds threat on every enemy hitting it (TabForThreat).
 bool PartyBotAI::UpdateTankDuty()
 {
     PartyBotTankSlotMap const& slots = GetTankSlots();
@@ -1844,37 +1845,37 @@ bool PartyBotAI::UpdateTankDuty()
             otherTanks = true;
 
     Unit* pVictim = me->GetVictim();
+    if (pVictim && !IsValidHostileTarget(pVictim))
+        pVictim = nullptr;
 
-    if (Unit* pMark = GetFocusMarkTarget())
+    Unit* pMark = GetFocusMarkTarget();
+    if (pMark && m_singleFocus)
     {
-        // Away from the mark to build threat: allowed while the mark is on us and nobody is
-        // about to pull it (tabbing away itself needs the mark safe, see TabForThreat).
-        bool const tabbedAway = !m_singleFocus && pVictim && pVictim != pMark &&
-            pVictim->GetVictim() == me && IsValidHostileTarget(pVictim) &&
-            pMark->GetVictim() == me && GetThreatLead(pMark, false) >= PB_TANK_DANGER_LEAD;
-
-        if (pVictim != pMark && !tabbedAway)
+        if (pVictim != pMark)
         {
             me->AttackStop(true);
             AttackStart(pMark);
-            pVictim = pMark;
         }
-
-        if (!m_singleFocus && pMark->GetVictim() == me)
-        {
-            if (Unit* pLoose = SelectLooseEnemy(slots))
-                if (TauntIfAllowed(pLoose, slots, otherTanks))
-                    return true;
-
-            TabForThreat(pVictim);
-        }
-
         return TauntIfAllowed(pMark, slots, otherTanks);
     }
 
-    bool const grabLoose = !(mySlot == PB_TANK_SLOT_MT && otherTanks);
-    if (grabLoose &&
-       (!pVictim || pVictim->GetVictim() == me || GetSlotOf(slots, pVictim->GetVictim()) != PB_TANK_SLOT_NONE))
+    // With a mark: free to leave it only while it is covered - on us and nobody about to pull
+    // it, or held by another tank (then this tank is free for the loose enemies).
+    Unit* pMarkVictim = pMark ? pMark->GetVictim() : nullptr;
+    bool const markHeld = pMarkVictim &&
+        (pMarkVictim == me ? GetThreatLead(pMark, false) >= PB_TANK_DANGER_LEAD :
+                             GetSlotOf(slots, pMarkVictim) != PB_TANK_SLOT_NONE);
+    if (pMark && pVictim != pMark && !markHeld)
+    {
+        me->AttackStop(true);
+        AttackStart(pMark);
+        return TauntIfAllowed(pMark, slots, otherTanks);
+    }
+
+    // Grab a loose enemy unless the current target is one already.
+    bool const victimIsLoose = pVictim && pVictim->GetVictim() && pVictim->GetVictim() != me &&
+        GetSlotOf(slots, pVictim->GetVictim()) == PB_TANK_SLOT_NONE;
+    if (!victimIsLoose)
     {
         if (Unit* pLoose = SelectLooseEnemy(slots))
         {
@@ -1895,7 +1896,9 @@ bool PartyBotAI::UpdateTankDuty()
 
     pVictim = TabForThreat(pVictim);
 
-    return TauntIfAllowed(pVictim, slots, otherTanks);
+    if (TauntIfAllowed(pVictim, slots, otherTanks))
+        return true;
+    return pMark && TauntIfAllowed(pMark, slots, otherTanks);
 }
 
 bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget, bool forced)
@@ -1921,57 +1924,8 @@ bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget, bool forced)
     return false;
 }
 
-// Healer hit in melee: run to the nearest tank (bot or player with a tank slot) so the tank
-// can pick the enemy up at once, like a player would. Not on stay/toggle, not while someone in
-// the group is below 40% health (healing first), only when the tank is 8-40 yd away.
-bool PartyBotAI::HealerRunToTank()
-{
-    if (!CanMoveOnOwn() || me->IsNonMeleeSpellCasted())
-        return false;
-
-    bool hitInMelee = false;
-    for (auto const pAttacker : me->GetAttackers())
-        if (pAttacker->GetVictim() == me && pAttacker->CanReachWithMeleeAutoAttack(me))
-            hitInMelee = true;
-    if (!hitInMelee)
-        return false;
-
-    Player* pTank = nullptr;
-    float tankDistance = 0.0f;
-    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr != nullptr; itr = itr->next())
-    {
-        Player* pMember = itr->getSource();
-        if (!pMember || !pMember->IsAlive() || !pMember->IsInMap(me))
-            continue;
-        if (pMember != me && pMember->GetHealthPercent() < 40.0f)
-            return false;
-        if (pMember == me || GetSlotOf(GetTankSlots(), pMember) == PB_TANK_SLOT_NONE)
-            continue;
-        float const distance = me->GetDistance(pMember);
-        if (!pTank || distance < tankDistance)
-        {
-            pTank = pMember;
-            tankDistance = distance;
-        }
-    }
-
-    if (!pTank || tankDistance < 8.0f || tankDistance > 40.0f)
-        return false;
-
-    if (!me->IsMoving())
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: hit by an enemy, runs to tank %s",
-            me->GetName(), pTank->GetName());
-    float x, y, z;
-    pTank->GetPosition(x, y, z);
-    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
-    return true;
-}
-
 void PartyBotAI::UpdateInCombatAI()
 {
-    if (m_role == ROLE_HEALER && !IsInDuel() && HealerRunToTank())
-        return;
-
     if (!IsInDuel())
     {
         if (m_role == ROLE_TANK)
