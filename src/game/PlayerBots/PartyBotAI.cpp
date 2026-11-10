@@ -662,6 +662,11 @@ void PartyBotAI::UpdateAI(uint32 const diff)
                 if (m_role == ROLE_INVALID)
                     AutoAssignRole();
 
+                // Ding sync: role talents and trainer spells from the start; the bot earns no XP
+                // itself and only levels together with the leader.
+                LearnSpellsAndTalentsForLevel(true);
+                me->SetPersonalXpRate(0.0f);
+
                 AutoEquipGear(sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_AUTO_EQUIP));
 
                 // fix client bug causing some item slots to not be visible
@@ -717,6 +722,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (!pLeader->IsInWorld())
         return;
+
+    if (IsLevelSynced() && pLeader->GetLevel() > me->GetLevel())
+        SyncLevelWithLeader(pLeader);
 
     if (pLeader->InBattleGround() &&
         !me->InBattleGround())
@@ -1272,6 +1280,127 @@ void PartyBotAI::UpdateOutOfCombatAI()
             UpdateOutOfCombatAI_Druid();
             break;
     }
+}
+
+// The talent tree with the most talent ranks learned (UINT32_MAX if none).
+uint32 PartyBotAI::GetMainTalentTab() const
+{
+    std::map<uint32, uint32> ranksPerTab;
+    for (uint32 talentId = 0; talentId < sTalentStore.GetNumRows(); ++talentId)
+    {
+        TalentEntry const* talentInfo = sTalentStore.LookupEntry(talentId);
+        if (!talentInfo)
+            continue;
+
+        TalentTabEntry const* tabInfo = sTalentTabStore.LookupEntry(talentInfo->TalentTab);
+        if (!tabInfo || !(me->GetClassMask() & tabInfo->ClassMask))
+            continue;
+
+        for (int32 rank = MAX_TALENT_RANK - 1; rank >= 0; --rank)
+        {
+            if (talentInfo->RankID[rank] && me->HasSpell(talentInfo->RankID[rank]))
+            {
+                ranksPerTab[talentInfo->TalentTab] += rank + 1;
+                break;
+            }
+        }
+    }
+
+    uint32 bestTab = UINT32_MAX;
+    uint32 bestRanks = 0;
+    for (auto const& itr : ranksPerTab)
+    {
+        if (itr.second > bestRanks)
+        {
+            bestTab = itr.first;
+            bestRanks = itr.second;
+        }
+    }
+    return bestTab;
+}
+
+// Spends free talent points on the highest-level premade spec of the bot's class and role
+// (the level 60 PvE specs), in template order, rank by rank. Talents whose tier is not
+// reached yet are picked up on later dings. False if no spec matches the role.
+bool PartyBotAI::LearnRoleSpecTalents()
+{
+    PlayerPremadeSpecTemplate const* pSpec = nullptr;
+    for (auto const& itr : sObjectMgr.GetPlayerPremadeSpecTemplates())
+    {
+        if (itr.second.requiredClass == me->GetClass() && itr.second.role == m_role &&
+           (!pSpec || itr.second.level > pSpec->level))
+            pSpec = &itr.second;
+    }
+
+    if (!pSpec)
+        return false;
+
+    std::vector<TalentSpellPos const*> talents;
+    for (uint32 spellId : pSpec->spells)
+        if (TalentSpellPos const* pPos = GetTalentSpellPos(spellId))
+            talents.push_back(pPos);
+
+    bool progress = true;
+    while (progress && me->GetFreeTalentPoints())
+    {
+        progress = false;
+        for (TalentSpellPos const* pPos : talents)
+            for (uint32 rank = 0; rank <= pPos->rank && me->GetFreeTalentPoints(); ++rank)
+                if (me->LearnTalent(pPos->talent_id, rank))
+                    progress = true;
+    }
+    return true;
+}
+
+// Trainer spells up to the current level, then talents: the role's spec, or (no spec for the
+// role) random talents kept in the tree the bot already uses. resetTalents replaces the talents
+// a new bot got from the class's generic premade spec.
+void PartyBotAI::LearnSpellsAndTalentsForLevel(bool resetTalents)
+{
+    char args[] = "";
+    ChatHandler(me).HandleLearnAllTrainerCommand(args);
+
+    uint32 const mainTab = GetMainTalentTab();
+    bool hasRoleSpec = false;
+    for (auto const& itr : sObjectMgr.GetPlayerPremadeSpecTemplates())
+        if (itr.second.requiredClass == me->GetClass() && itr.second.role == m_role)
+            hasRoleSpec = true;
+
+    if (hasRoleSpec)
+    {
+        if (resetTalents)
+            me->ResetTalents(true);
+        LearnRoleSpecTalents();
+    }
+
+    // No spec for the role, or the spec has fewer points than the bot (e.g. a lower-level
+    // template): put the rest into the tree the bot mostly uses.
+    if (me->GetFreeTalentPoints())
+        LearnRandomTalents(hasRoleSpec ? GetMainTalentTab() : mainTab);
+}
+
+void PartyBotAI::SyncLevelWithLeader(Player const* pLeader)
+{
+    uint32 const oldLevel = me->GetLevel();
+    uint32 const newLevel = std::min(pLeader->GetLevel(), sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL));
+    if (newLevel <= oldLevel)
+        return;
+
+    size_t const oldSpellCount = me->GetSpellMap().size();
+
+    me->GiveLevel(newLevel);
+    me->InitTalentForLevel();
+    me->SetUInt32Value(PLAYER_XP, 0);
+    LearnSpellsAndTalentsForLevel(false);
+    me->UpdateSkillsToMaxSkillsForLevel();
+
+    ResetSpellData();
+    PopulateSpellData();
+    AddAllSpellReagents();
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Ding] %s: %u -> %u, spell book %+d, %u talent points unspent",
+        me->GetName(), oldLevel, newLevel, int32(me->GetSpellMap().size()) - int32(oldSpellCount),
+        me->GetFreeTalentPoints());
 }
 
 // Manual tank slots of real players (bots keep theirs in their AI). Commands and map threads

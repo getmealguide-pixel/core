@@ -134,6 +134,14 @@ public:
     bool TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks);
     bool UpdateTankDuty();
 
+    // Ding sync (temporary .partybot add bots only): match the leader's level, then learn
+    // trainer spells and talents of the bot's role.
+    bool IsLevelSynced() const { return m_race && m_class && m_cloneGuid.IsEmpty(); }
+    void SyncLevelWithLeader(Player const* pLeader);
+    void LearnSpellsAndTalentsForLevel(bool resetTalents);
+    bool LearnRoleSpecTalents();
+    uint32 GetMainTalentTab() const;
+
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
     void UpdateOutOfCombatAI() final;
