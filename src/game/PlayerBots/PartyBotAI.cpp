@@ -51,7 +51,6 @@ enum PartyBotSpells
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
 #define PB_AUTO_AOE_MIN_TARGETS 4    // auto AoE when more than 3 enemies stand around the target
 #define PB_AUTO_AOE_RADIUS 10.0f
-#define PB_AOE_DAMAGE_SAFETY 1.5f    // AoE aggro check: estimated spell damage x this (spell power, crits)
 #define PB_TANK_SAFE_LEAD 1.5f       // tank threat >= this x anyone else's = enemy is safe
 #define PB_TANK_DANGER_LEAD 1.15f    // tank threat below this x someone else's = about to switch
 #define PB_TANK_THREAT_FLOOR 10.0f   // per tank level: threat counted as "anyone else" at minimum
@@ -287,51 +286,6 @@ bool PartyBotAI::ShouldAutoRevive() const
     return alivePlayerNearby;
 }
 
-// Rough damage one target takes from a hostile spell over its whole duration (direct hits,
-// damage over time, triggered spells, weapon strikes). Bonus damage is not included; callers
-// add a safety factor. Never 0 (unknown spells count as 10 per caster level).
-float PartyBotAI::EstimateSpellDamage(SpellEntry const* pSpellEntry, uint8 depth) const
-{
-    float total = 0.0f;
-    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
-    {
-        float const value = float(std::max(0, pSpellEntry->CalculateSimpleValue(SpellEffectIndex(i))));
-        int32 const ticks = pSpellEntry->EffectAmplitude[i] ?
-            std::max(1, pSpellEntry->GetDuration() / int32(pSpellEntry->EffectAmplitude[i])) : 1;
-        SpellEntry const* pTriggered = (depth < 2 && pSpellEntry->EffectTriggerSpell[i]) ?
-            sSpellMgr.GetSpellEntry(pSpellEntry->EffectTriggerSpell[i]) : nullptr;
-
-        switch (pSpellEntry->Effect[i])
-        {
-            case SPELL_EFFECT_SCHOOL_DAMAGE:
-                total += value;
-                break;
-            case SPELL_EFFECT_WEAPON_DAMAGE:
-            case SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL:
-            case SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
-            case SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
-                total += value + std::max(me->GetFloatValue(UNIT_FIELD_MAXDAMAGE),
-                                          me->GetFloatValue(UNIT_FIELD_MAXRANGEDDAMAGE));
-                break;
-            case SPELL_EFFECT_TRIGGER_SPELL:
-                if (pTriggered)
-                    total += EstimateSpellDamage(pTriggered, depth + 1);
-                break;
-            case SPELL_EFFECT_APPLY_AURA:
-            case SPELL_EFFECT_PERSISTENT_AREA_AURA:
-                if (pSpellEntry->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE)
-                    total += value * ticks;
-                else if (pSpellEntry->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_TRIGGER_SPELL && pTriggered)
-                    total += EstimateSpellDamage(pTriggered, depth + 1) * ticks;
-                break;
-        }
-    }
-
-    if (depth == 0 && total <= 0.0f)
-        total = me->GetLevel() * 10.0f;
-    return total;
-}
-
 bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpellEntry) const
 {
     if (!CombatBotBaseAI::CanTryToCastSpell(pTarget, pSpellEntry))
@@ -342,10 +296,10 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
        (pSpellEntry->HasEffect(SPELL_EFFECT_CHARGE) || pSpellEntry->HasEffect(SPELL_EFFECT_LEAP)))
         return false;
 
-    // Following a moving leader (toggle: always; other follow modes: out of combat): only
-    // instant spells, a cast would stop the bot. Instant spells and buffs stay allowed.
+    // Following a moving leader (toggle: always; other follow modes: out of combat and no
+    // target): only instant spells, a cast would stop the bot. A bot with a target fights.
     if (!m_holdPosition && (pSpellEntry->IsChanneledSpell() || pSpellEntry->GetCastTime(me) > 0) &&
-       (m_followMode == PB_FOLLOW_STACKED || !me->IsInCombat()))
+       (m_followMode == PB_FOLLOW_STACKED || (!me->IsInCombat() && !me->GetVictim())))
     {
         Player const* pLeader = GetPartyLeader();
         if (me->IsMoving() || (pLeader && pLeader->IsMoving()))
@@ -357,55 +311,32 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
         if (!m_marksToCC.empty())
             return false;
 
-        // Do not cast AoE if it would pull aggro (tanks excepted).
-        if (m_role != ROLE_TANK)
+        // AoE is free to use (the tank tab-tanks and catches up). Only two rules: never break
+        // crowd control, never pull enemies that are not fighting yet (weak ones excepted).
+        float radius;
+        if (pSpellEntry->EffectRadiusIndex[0])
+            radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[0]));
+        else if (pSpellEntry->EffectRadiusIndex[1])
+            radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[1]));
+        else if (pSpellEntry->EffectRadiusIndex[2])
+            radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[2]));
+        else
+            radius = 10.0f;
+
+        // Self-centred spells (Arcane Explosion, Whirlwind) hit around the caster.
+        Unit const* pCenter = pSpellEntry->rangeIndex == SPELL_RANGE_IDX_SELF_ONLY ? me : pTarget;
+
+        std::list<Unit*> targets;
+        me->GetEnemyListInRadiusAround(pCenter, radius, targets);
+
+        for (auto const& pEnemy : targets)
         {
-            float radius;
-            if (pSpellEntry->EffectRadiusIndex[0])
-                radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[0]));
-            else if (pSpellEntry->EffectRadiusIndex[1])
-                radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[1]));
-            else if (pSpellEntry->EffectRadiusIndex[2])
-                radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[2]));
-            else
-                radius = 10.0f;
+            if (pEnemy->HasBreakableByDamageCrowdControlAura())
+                return false;
 
-            // Self-centred spells (Arcane Explosion, Whirlwind) hit around the caster.
-            Unit const* pCenter = pSpellEntry->rangeIndex == SPELL_RANGE_IDX_SELF_ONLY ? me : pTarget;
-            float const burst = EstimateSpellDamage(pSpellEntry) * PB_AOE_DAMAGE_SAFETY;
-
-            std::list<Unit*> targets;
-            me->GetEnemyListInRadiusAround(pCenter, radius, targets);
-
-            for (auto const& pEnemy : targets)
-            {
-                // Never break crowd control.
-                if (pEnemy->HasBreakableByDamageCrowdControlAura())
-                    return false;
-
-                // Weak enemies do not matter.
-                if ((pEnemy->GetLevel() + 5) <= me->GetLevel() ||
-                    (pEnemy->GetHealth() * 4) <= me->GetHealth() ||
-                    !pEnemy->IsValidAttackTarget(me))
-                    continue;
-
-                // Never pull a pack that is not fighting yet.
-                if (!pEnemy->IsInCombat())
-                    return false;
-
-                Unit* pEnemyVictim = pEnemy->GetVictim();
-                if (!pEnemyVictim || pEnemyVictim == me || !pEnemy->CanHaveThreatList())
-                    continue;
-
-                // Real aggro rule: an enemy switches at 110% of its victim's threat in melee
-                // range, 130% at range. Count this spell's whole damage on top of my threat.
-                float const myThreat = pEnemy->GetThreatManager().getThreat(me);
-                float const victimThreat = pEnemy->GetThreatManager().getThreat(pEnemyVictim);
-                float const pullFactor = pEnemy->CanReachWithMeleeAutoAttack(me) ? 1.1f : 1.3f;
-
-                if (myThreat + burst >= victimThreat * pullFactor)
-                    return false;
-            }
+            if (!pEnemy->IsInCombat() && (pEnemy->GetLevel() + 5) > me->GetLevel() &&
+                pEnemy->IsValidAttackTarget(me))
+                return false;
         }
     }
 
@@ -1074,7 +1005,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         }
     }
 
-    if (me->IsInCombat())
+    // In combat, or the group fights and this bot has a target (not hit yet): full rotation.
+    if (me->IsInCombat() || (groupFighting && me->GetVictim()))
         UpdateInCombatAI();
 }
 
@@ -1989,8 +1921,57 @@ bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget, bool forced)
     return false;
 }
 
+// Healer hit in melee: run to the nearest tank (bot or player with a tank slot) so the tank
+// can pick the enemy up at once, like a player would. Not on stay/toggle, not while someone in
+// the group is below 40% health (healing first), only when the tank is 8-40 yd away.
+bool PartyBotAI::HealerRunToTank()
+{
+    if (!CanMoveOnOwn() || me->IsNonMeleeSpellCasted())
+        return false;
+
+    bool hitInMelee = false;
+    for (auto const pAttacker : me->GetAttackers())
+        if (pAttacker->GetVictim() == me && pAttacker->CanReachWithMeleeAutoAttack(me))
+            hitInMelee = true;
+    if (!hitInMelee)
+        return false;
+
+    Player* pTank = nullptr;
+    float tankDistance = 0.0f;
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || !pMember->IsAlive() || !pMember->IsInMap(me))
+            continue;
+        if (pMember != me && pMember->GetHealthPercent() < 40.0f)
+            return false;
+        if (pMember == me || GetSlotOf(GetTankSlots(), pMember) == PB_TANK_SLOT_NONE)
+            continue;
+        float const distance = me->GetDistance(pMember);
+        if (!pTank || distance < tankDistance)
+        {
+            pTank = pMember;
+            tankDistance = distance;
+        }
+    }
+
+    if (!pTank || tankDistance < 8.0f || tankDistance > 40.0f)
+        return false;
+
+    if (!me->IsMoving())
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: hit by an enemy, runs to tank %s",
+            me->GetName(), pTank->GetName());
+    float x, y, z;
+    pTank->GetPosition(x, y, z);
+    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+    return true;
+}
+
 void PartyBotAI::UpdateInCombatAI()
 {
+    if (m_role == ROLE_HEALER && !IsInDuel() && HealerRunToTank())
+        return;
+
     if (!IsInDuel())
     {
         if (m_role == ROLE_TANK)
