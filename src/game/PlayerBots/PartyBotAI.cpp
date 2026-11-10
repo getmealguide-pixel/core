@@ -49,6 +49,8 @@ enum PartyBotSpells
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
+#define PB_AUTO_AOE_MIN_TARGETS 4    // auto AoE when more than 3 enemies stand around the target
+#define PB_AUTO_AOE_RADIUS 10.0f
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -1790,6 +1792,29 @@ bool PartyBotAI::UpdateTankDuty()
     return TauntIfAllowed(pVictim, slots, otherTanks);
 }
 
+bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget, bool forced)
+{
+    for (auto const& pSpell : m_spells.raw.spells)
+    {
+        if (!pSpell || !pSpell->IsAreaOfEffectSpell() || pSpell->IsPositiveSpell() ||
+            !pSpell->IsTargetInRange(me, pTarget))
+            continue;
+
+        if (forced)
+        {
+            if (me->GetCurrentSpell(CURRENT_GENERIC_SPELL) &&
+               !me->GetCurrentSpell(CURRENT_GENERIC_SPELL)->m_spellInfo->IsAreaOfEffectSpell())
+                me->InterruptSpell(CURRENT_GENERIC_SPELL);
+
+            if (me->CastSpell(pTarget, pSpell, false) == SPELL_CAST_OK)
+                return true;
+        }
+        else if (CanTryToCastSpell(pTarget, pSpell) && DoCastSpell(pTarget, pSpell) == SPELL_CAST_OK)
+            return true;
+    }
+    return false;
+}
+
 void PartyBotAI::UpdateInCombatAI()
 {
     if (!IsInDuel())
@@ -1805,6 +1830,14 @@ void PartyBotAI::UpdateInCombatAI()
 
     if (CheckForDispelTargets())
         return;
+
+    // Auto AoE: damage dealers on a pack of more than 3 enemies (CC marks and not-yet-pulled
+    // mobs are still protected by CanTryToCastSpell).
+    if (m_autoAoE && !IsInDuel() && (m_role == ROLE_MELEE_DPS || m_role == ROLE_RANGE_DPS))
+        if (Unit* pVictim = me->GetVictim())
+            if (me->GetEnemyCountInRadiusAround(pVictim, PB_AUTO_AOE_RADIUS) >= PB_AUTO_AOE_MIN_TARGETS &&
+                CastAreaOfEffectSpell(pVictim, false))
+                return;
 
     switch (me->GetClass())
     {
@@ -3780,10 +3813,38 @@ void PartyBotAI::UpdateOutOfCombatAI_Druid()
         return;
     }
 
+    // Feral druids (tank: bear, melee: cat) always keep enough mana to shift back after buffing.
+    SpellEntry const* pFeralForm = m_role == ROLE_TANK ? m_spells.druid.pBearForm :
+                                   (m_role == ROLE_MELEE_DPS ? m_spells.druid.pCatForm : nullptr);
+    auto keepsBearFormMana = [this, pFeralForm](SpellEntry const* pSpell)
+    {
+        if (!pFeralForm)
+            return true;
+        return me->GetPower(POWER_MANA) >= Spell::CalculatePowerCost(pSpell, me) +
+               Spell::CalculatePowerCost(pFeralForm, me);
+    };
+
+    // Out of combat and no target: a feral druid leaves its form when someone needs Mark of the
+    // Wild or Thorns and the mana allows it; it buffs below and shifts back afterwards.
+    if (pFeralForm && !me->GetVictim() && me->GetShapeshiftForm() != FORM_NONE &&
+        me->HasAuraType(SPELL_AURA_MOD_SHAPESHIFT))
+    {
+        SpellEntry const* pNeededBuff = nullptr;
+        bool needsBuff = SelectBuffTarget(m_spells.druid.pMarkoftheWild, m_spells.druid.pGiftoftheWild, pNeededBuff) &&
+                         pNeededBuff && keepsBearFormMana(pNeededBuff);
+        if (!needsBuff && m_spells.druid.pThorns)
+            needsBuff = SelectBuffTarget(m_spells.druid.pThorns) && keepsBearFormMana(m_spells.druid.pThorns);
+        if (needsBuff)
+        {
+            me->RemoveSpellsCausingAura(SPELL_AURA_MOD_SHAPESHIFT);
+            return;
+        }
+    }
+
     SpellEntry const* pBuffSpell = nullptr;
     if (Player* pTarget = SelectBuffTarget(m_spells.druid.pMarkoftheWild, m_spells.druid.pGiftoftheWild, pBuffSpell))
     {
-        if (CanTryToCastSpell(pTarget, pBuffSpell))
+        if (keepsBearFormMana(pBuffSpell) && CanTryToCastSpell(pTarget, pBuffSpell))
         {
             if (DoCastSpell(pTarget, pBuffSpell) == SPELL_CAST_OK)
             {
@@ -3798,7 +3859,7 @@ void PartyBotAI::UpdateOutOfCombatAI_Druid()
     {
         if (Player* pTarget = SelectBuffTarget(m_spells.druid.pThorns))
         {
-            if (CanTryToCastSpell(pTarget, m_spells.druid.pThorns))
+            if (keepsBearFormMana(m_spells.druid.pThorns) && CanTryToCastSpell(pTarget, m_spells.druid.pThorns))
             {
                 if (DoCastSpell(pTarget, m_spells.druid.pThorns) == SPELL_CAST_OK)
                 {
@@ -3855,6 +3916,10 @@ void PartyBotAI::UpdateInCombatAI_Druid()
         if (DoCastSpell(me, m_spells.druid.pBarkskin) == SPELL_CAST_OK)
             return;
     }
+
+    // Tanks shift to bear form before anything else (no healing/HoTs in caster form first).
+    if (form == FORM_NONE && m_role == ROLE_TANK && EnterCombatDruidForm())
+        return;
 
     if (form == FORM_NONE)
     {

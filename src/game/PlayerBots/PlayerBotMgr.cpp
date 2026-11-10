@@ -1347,15 +1347,33 @@ bool ChatHandler::HandlePartyBotSlotsCommand(char* /*args*/)
     return true;
 }
 
-// .partybot singlefocus on|off [all]: tank only its focus mark (on) or also loose enemies (off).
-// A selected bot wins over "all".
-bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
+enum PartyBotOnOffSetting : uint8
+{
+    PB_SETTING_SINGLE_FOCUS,
+    PB_SETTING_AUTO_AOE,
+};
+
+static void SetPartyBotOnOffSetting(PartyBotAI* pAI, uint8 setting, bool on)
+{
+    switch (setting)
+    {
+        case PB_SETTING_SINGLE_FOCUS:
+            pAI->m_singleFocus = on;
+            break;
+        case PB_SETTING_AUTO_AOE:
+            pAI->m_autoAoE = on;
+            break;
+    }
+}
+
+// On/off bot settings: ".partybot <name> on|off [all]". A selected bot wins over "all".
+bool ChatHandler::HandlePartyBotOnOffHelper(char* args, char const* name, uint8 setting)
 {
     char* arg1 = ExtractArg(&args);
     char* arg2 = ExtractArg(&args);
     if (!arg1 || (strcmp(arg1, "on") != 0 && strcmp(arg1, "off") != 0))
     {
-        SendSysMessage("Usage: .partybot singlefocus on|off [all]");
+        PSendSysMessage("Usage: .partybot %s on|off [all]", name);
         SetSentErrorMessage(true);
         return false;
     }
@@ -1367,8 +1385,8 @@ bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
     Player* pTarget = GetSelectedPlayer();
     if (pTarget && pTarget != pPlayer && dynamic_cast<PartyBotAI*>(pTarget->AI()))
     {
-        GetCommandedPartyBotAI(pTarget)->m_singleFocus = on;
-        PSendSysMessage("%s single focus %s.", pTarget->GetName(), on ? "on" : "off");
+        SetPartyBotOnOffSetting(GetCommandedPartyBotAI(pTarget), setting, on);
+        PSendSysMessage("%s %s %s.", pTarget->GetName(), name, on ? "on" : "off");
         return true;
     }
 
@@ -1390,10 +1408,22 @@ bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
     for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
         if (Player* pMember = itr->getSource())
             if (pMember != pPlayer && dynamic_cast<PartyBotAI*>(pMember->AI()))
-                GetCommandedPartyBotAI(pMember)->m_singleFocus = on;
+                SetPartyBotOnOffSetting(GetCommandedPartyBotAI(pMember), setting, on);
 
-    PSendSysMessage("All party bots single focus %s.", on ? "on" : "off");
+    PSendSysMessage("All party bots %s %s.", name, on ? "on" : "off");
     return true;
+}
+
+// .partybot singlefocus on|off [all]: tank only its focus mark (on) or also loose enemies (off).
+bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
+{
+    return HandlePartyBotOnOffHelper(args, "singlefocus", PB_SETTING_SINGLE_FOCUS);
+}
+
+// .partybot autoaoe on|off [all]: damage dealers use area spells on big packs (default on).
+bool ChatHandler::HandlePartyBotAutoAoECommand(char* args)
+{
+    return HandlePartyBotOnOffHelper(args, "autoaoe", PB_SETTING_AUTO_AOE);
 }
 
 bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
@@ -1519,22 +1549,7 @@ bool ChatHandler::HandlePartyBotAoECommand(char* args)
             if (pMember->AI())
             {
                 if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
-                {
-                    for (auto const& pSpell : pAI->m_spells.raw.spells)
-                    {
-                        if (pSpell && pSpell->IsAreaOfEffectSpell() &&
-                           !pSpell->IsPositiveSpell() &&
-                            pSpell->IsTargetInRange(pMember, pTarget))
-                        {
-                            if (pMember->GetCurrentSpell(CURRENT_GENERIC_SPELL) &&
-                               !pMember->GetCurrentSpell(CURRENT_GENERIC_SPELL)->m_spellInfo->IsAreaOfEffectSpell())
-                                pMember->InterruptSpell(CURRENT_GENERIC_SPELL);
-
-                            if (pMember->CastSpell(pTarget, pSpell, false) == SPELL_CAST_OK)
-                                break;
-                        }
-                    }
-                }
+                    pAI->CastAreaOfEffectSpell(pTarget, true);
             }
         }
     }

@@ -2251,6 +2251,10 @@ bool CombatBotBaseAI::IsValidBuffTarget(Unit const* pTarget, SpellEntry const* p
 
 Player* CombatBotBaseAI::SelectBuffTarget(SpellEntry const* pSpellEntry) const
 {
+    // Pull/attack order (target but not yet in combat): fight first, buff the group later.
+    if (me->GetVictim() && !me->IsInCombat())
+        return nullptr;
+
     Group* pGroup = me->GetGroup();
     if (pGroup)
     {

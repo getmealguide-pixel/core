@@ -100,6 +100,7 @@ ChatCommand * ChatHandler::getCommandTable()
         { "slot",       SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotSlotCommand,        "", nullptr },
         { "slots",      SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotSlotsCommand,       "", nullptr },
         { "singlefocus",SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotSingleFocusCommand, "", nullptr },
+        { "autoaoe",    SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotAutoAoECommand,     "", nullptr },
         { "attackstart",SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotAttackStartCommand, "", nullptr },
         { "attackstop", SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotAttackStopCommand,  "", nullptr },
         { "pull",       SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotPullCommand,        "", nullptr },

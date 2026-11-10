@@ -143,6 +143,10 @@ public:
     bool LearnRoleSpecTalents();
     uint32 GetMainTalentTab() const;
 
+    // Casts the first usable hostile area spell at the target. forced (.partybot aoe): no
+    // usability checks and interrupts a non-area cast; otherwise the normal casting rules apply.
+    bool CastAreaOfEffectSpell(Unit* pTarget, bool forced);
+
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
     void UpdateOutOfCombatAI() final;
@@ -195,6 +199,7 @@ public:
     bool m_tankSlotManual = false;               // slot set by command (else automatic)
     uint8 m_tankSlotChoice = PB_TANK_SLOT_NONE;  // the manual slot
     bool m_singleFocus = false;                  // tank only its focus mark, ignore loose enemies
+    bool m_autoAoE = true;                       // damage dealers use area spells on big packs
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
     mutable PartyBotTankSlotMap m_tankSlotCache;
     mutable uint32 m_tankSlotCacheTime = 0;
