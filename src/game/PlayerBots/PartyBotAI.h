@@ -40,6 +40,17 @@ enum PartyBotFollowMode : uint8
     PB_FOLLOW_STACKED, // "toggle": stay stacked on the leader all the time
 };
 
+// Tank slots: main tank and numbered off-tanks. Everyone else has PB_TANK_SLOT_NONE.
+enum PartyBotTankSlot : uint8
+{
+    PB_TANK_SLOT_NONE = 0,
+    PB_TANK_SLOT_MT   = 1,
+    PB_TANK_SLOT_OT1  = 2,  // OTn = PB_TANK_SLOT_OT1 + n - 1
+    PB_TANK_SLOT_MAX  = 11, // OT1..OT9
+};
+
+typedef std::map<ObjectGuid, uint8> PartyBotTankSlotMap;
+
 class PartyBotAI : public CombatBotBaseAI
 {
 public:
@@ -108,6 +119,21 @@ public:
     // Stay and toggle both forbid moving on its own (no chasing, running away, movement spells).
     bool CanMoveOnOwn() const final { return !m_holdPosition && m_followMode != PB_FOLLOW_STACKED; }
 
+    // Tank slots. Manual choices win; then the leader's tanking players and tank bots fill
+    // MT, OT1, OT2... in group order. Players' manual choices live in a shared table (not bots).
+    static void ResolveTankSlots(Group* pGroup, PartyBotTankSlotMap& slots);
+    static std::string GetTankSlotName(uint8 slot);
+    static bool GetPlayerTankSlotChoice(ObjectGuid guid, uint8& slot);
+    static void SetPlayerTankSlotChoice(ObjectGuid guid, bool manual, uint8 slot);
+    static void ClearManualTankSlot(Group* pGroup, uint8 slot);
+    PartyBotTankSlotMap const& GetTankSlots() const;
+    static uint8 GetSlotOf(PartyBotTankSlotMap const& slots, Unit const* pUnit);
+    uint8 GetHealPriority(Unit const* pUnit) const final;
+    Unit* GetFocusMarkTarget() const;
+    Unit* SelectLooseEnemy(PartyBotTankSlotMap const& slots) const;
+    bool TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks);
+    bool UpdateTankDuty();
+
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
     void UpdateOutOfCombatAI() final;
@@ -156,6 +182,12 @@ public:
     float m_holdX = 0.0f;
     float m_holdY = 0.0f;
     float m_holdZ = 0.0f;
+    bool m_tankSlotManual = false;               // slot set by command (else automatic)
+    uint8 m_tankSlotChoice = PB_TANK_SLOT_NONE;  // the manual slot
+    bool m_singleFocus = false;                  // tank only its focus mark, ignore loose enemies
+    uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
+    mutable PartyBotTankSlotMap m_tankSlotCache;
+    mutable uint32 m_tankSlotCacheTime = 0;
     PartyBotLayer m_activeLayer = PB_LAYER_NONE;
     char const* m_activeLayerName = "None";
 };

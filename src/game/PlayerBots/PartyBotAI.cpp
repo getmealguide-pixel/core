@@ -28,6 +28,7 @@
 #include "Chat.h"
 #include "Utilities/Random.h"
 
+#include <mutex>
 #include <random>
 
 enum PartyBotSpells
@@ -1273,36 +1274,339 @@ void PartyBotAI::UpdateOutOfCombatAI()
     }
 }
 
+// Manual tank slots of real players (bots keep theirs in their AI). Commands and map threads
+// both read it, so it is guarded.
+static std::mutex s_playerTankSlotsLock;
+static std::map<ObjectGuid, uint8> s_playerTankSlots;
+
+bool PartyBotAI::GetPlayerTankSlotChoice(ObjectGuid guid, uint8& slot)
+{
+    std::lock_guard<std::mutex> guard(s_playerTankSlotsLock);
+    auto itr = s_playerTankSlots.find(guid);
+    if (itr == s_playerTankSlots.end())
+        return false;
+    slot = itr->second;
+    return true;
+}
+
+void PartyBotAI::SetPlayerTankSlotChoice(ObjectGuid guid, bool manual, uint8 slot)
+{
+    std::lock_guard<std::mutex> guard(s_playerTankSlotsLock);
+    if (manual)
+        s_playerTankSlots[guid] = slot;
+    else
+        s_playerTankSlots.erase(guid);
+}
+
+// Removes a manual slot from whoever holds it, so a slot is never given twice.
+void PartyBotAI::ClearManualTankSlot(Group* pGroup, uint8 slot)
+{
+    if (!pGroup || slot == PB_TANK_SLOT_NONE)
+        return;
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember)
+            continue;
+
+        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+        {
+            if (pAI->m_tankSlotManual && pAI->m_tankSlotChoice == slot)
+                pAI->m_tankSlotManual = false;
+        }
+        else
+        {
+            uint8 choice;
+            if (GetPlayerTankSlotChoice(pMember->GetObjectGuid(), choice) && choice == slot)
+                SetPlayerTankSlotChoice(pMember->GetObjectGuid(), false, PB_TANK_SLOT_NONE);
+        }
+    }
+}
+
+std::string PartyBotAI::GetTankSlotName(uint8 slot)
+{
+    if (slot == PB_TANK_SLOT_MT)
+        return "MT";
+    if (slot >= PB_TANK_SLOT_OT1 && slot < PB_TANK_SLOT_MAX)
+        return "OT" + std::to_string(slot - PB_TANK_SLOT_OT1 + 1);
+    return "none";
+}
+
+void PartyBotAI::ResolveTankSlots(Group* pGroup, PartyBotTankSlotMap& slots)
+{
+    slots.clear();
+    if (!pGroup)
+        return;
+
+    bool taken[PB_TANK_SLOT_MAX] = {};
+    std::vector<Player*> autoPlayers; // real players who are tanking (shield or tank form)
+    std::vector<Player*> autoBots;    // bots with the tank role
+
+    // 1. Manual choices.
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember)
+            continue;
+
+        bool manual = false;
+        uint8 choice = PB_TANK_SLOT_NONE;
+        bool autoTank = false;
+
+        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+        {
+            manual = pAI->m_tankSlotManual;
+            choice = pAI->m_tankSlotChoice;
+            autoTank = pAI->GetRole() == ROLE_TANK;
+        }
+        else
+        {
+            manual = GetPlayerTankSlotChoice(pMember->GetObjectGuid(), choice);
+            if (IsTankClass(pMember->GetClass()))
+            {
+                Item* pOffhand = pMember->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+                autoTank = IsTankingForm(pMember->GetShapeshiftForm()) ||
+                          (pOffhand && pOffhand->GetProto()->InventoryType == INVTYPE_SHIELD);
+            }
+        }
+
+        if (manual)
+        {
+            if (choice != PB_TANK_SLOT_NONE && choice < PB_TANK_SLOT_MAX && !taken[choice])
+            {
+                slots[pMember->GetObjectGuid()] = choice;
+                taken[choice] = true;
+            }
+        }
+        else if (autoTank)
+        {
+            if (pMember->AI())
+                autoBots.push_back(pMember);
+            else
+                autoPlayers.push_back(pMember);
+        }
+    }
+
+    // 2. Automatic: tanking players first (the user is MT when tanking), then tank bots.
+    std::vector<Player*> autoTanks = autoPlayers;
+    autoTanks.insert(autoTanks.end(), autoBots.begin(), autoBots.end());
+
+    uint8 next = PB_TANK_SLOT_MT;
+    for (Player* pTank : autoTanks)
+    {
+        while (next < PB_TANK_SLOT_MAX && taken[next])
+            ++next;
+        if (next >= PB_TANK_SLOT_MAX)
+            break;
+        slots[pTank->GetObjectGuid()] = next;
+        taken[next] = true;
+    }
+}
+
+// Resolved once per world tick and shared by all checks of that tick.
+PartyBotTankSlotMap const& PartyBotAI::GetTankSlots() const
+{
+    uint32 const now = WorldTimer::getMSTime();
+    if (now != m_tankSlotCacheTime)
+    {
+        ResolveTankSlots(me->GetGroup(), m_tankSlotCache);
+        m_tankSlotCacheTime = now;
+    }
+    return m_tankSlotCache;
+}
+
+uint8 PartyBotAI::GetSlotOf(PartyBotTankSlotMap const& slots, Unit const* pUnit)
+{
+    if (!pUnit)
+        return PB_TANK_SLOT_NONE;
+    auto itr = slots.find(pUnit->GetObjectGuid());
+    return itr == slots.end() ? PB_TANK_SLOT_NONE : itr->second;
+}
+
+uint8 PartyBotAI::GetHealPriority(Unit const* pUnit) const
+{
+    if (pUnit->GetTypeId() != TYPEID_PLAYER || !me->GetGroup())
+        return 0;
+
+    switch (GetSlotOf(GetTankSlots(), pUnit))
+    {
+        case PB_TANK_SLOT_NONE:
+            return 0;
+        case PB_TANK_SLOT_MT:
+            return 2;
+        default:
+            return 1;
+    }
+}
+
+Unit* PartyBotAI::GetFocusMarkTarget() const
+{
+    for (auto markId : m_marksToFocus)
+    {
+        ObjectGuid targetGuid = me->GetGroup()->GetTargetWithIcon(markId);
+        if (targetGuid.IsUnit())
+            if (Unit* pTarget = me->GetMap()->GetUnit(targetGuid))
+                if (IsValidHostileTarget(pTarget))
+                    return pTarget;
+    }
+    return nullptr;
+}
+
+// Nearest enemy attacking a group member without a tank slot, that no other tank bot is
+// already going for (so off-tanks share the adds out).
+Unit* PartyBotAI::SelectLooseEnemy(PartyBotTankSlotMap const& slots) const
+{
+    Group* pGroup = me->GetGroup();
+    Unit* pBest = nullptr;
+    float bestDistance = 0.0f;
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || pMember == me || GetSlotOf(slots, pMember) != PB_TANK_SLOT_NONE)
+            continue;
+
+        for (auto const pAttacker : pMember->GetAttackers())
+        {
+            if (!IsValidHostileTarget(pAttacker) || !me->IsWithinDist(pAttacker, 50.0f))
+                continue;
+
+            bool claimed = false;
+            for (GroupReference* itr2 = pGroup->GetFirstMember(); itr2 != nullptr; itr2 = itr2->next())
+            {
+                Player* pOther = itr2->getSource();
+                if (pOther && pOther != me && pOther->AI() && pOther->GetVictim() == pAttacker &&
+                    GetSlotOf(slots, pOther) != PB_TANK_SLOT_NONE)
+                {
+                    claimed = true;
+                    break;
+                }
+            }
+            if (claimed)
+                continue;
+
+            float const distance = me->GetDistance(pAttacker);
+            if (!pBest || distance < bestDistance)
+            {
+                pBest = pAttacker;
+                bestDistance = distance;
+            }
+        }
+    }
+
+    return pBest;
+}
+
+// Taunts an enemy that attacks someone else, but never one that attacks another tank
+// (bot or player). Area taunts only when this bot is the only tank.
+bool PartyBotAI::TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks)
+{
+    Unit* pEnemyVictim = pEnemy->GetVictim();
+    if (!pEnemyVictim || pEnemyVictim == me)
+        return false;
+
+    if (GetSlotOf(slots, pEnemyVictim) != PB_TANK_SLOT_NONE)
+        return false;
+
+    // Several tanks on the same enemy: only the highest slot (MT, then OT1...) taunts it.
+    uint8 const mySlot = GetSlotOf(slots, me);
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pOther = itr->getSource();
+        if (!pOther || pOther == me || pOther->GetVictim() != pEnemy)
+            continue;
+        uint8 const otherSlot = GetSlotOf(slots, pOther);
+        if (otherSlot != PB_TANK_SLOT_NONE && (mySlot == PB_TANK_SLOT_NONE || otherSlot < mySlot))
+            return false;
+    }
+
+    for (auto const& pSpellEntry : m_spellListTaunt)
+    {
+        if (otherTanks && pSpellEntry->IsAreaOfEffectSpell())
+            continue;
+
+        if (CanTryToCastSpell(pEnemy, pSpellEntry) &&
+            DoCastSpell(pEnemy, pSpellEntry) == SPELL_CAST_OK)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: taunts %s off %s", me->GetName(),
+                pEnemy->GetName(), pEnemyVictim->GetName());
+            return true;
+        }
+    }
+    return false;
+}
+
+// Tank role duty. Focus mark + single focus: only the mark. Focus mark: the mark, plus
+// taunting loose enemies while the mark is on us. No mark: grab every loose enemy, except a
+// main tank that has off-tanks (it holds the main target and leaves adds to them).
+bool PartyBotAI::UpdateTankDuty()
+{
+    PartyBotTankSlotMap const& slots = GetTankSlots();
+    uint8 const mySlot = GetSlotOf(slots, me);
+    if (mySlot != m_loggedTankSlot)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: slot %s -> %s", me->GetName(),
+            GetTankSlotName(m_loggedTankSlot).c_str(), GetTankSlotName(mySlot).c_str());
+        m_loggedTankSlot = mySlot;
+    }
+
+    bool otherTanks = false;
+    for (auto const& itr : slots)
+        if (itr.first != me->GetObjectGuid())
+            otherTanks = true;
+
+    Unit* pVictim = me->GetVictim();
+
+    if (Unit* pMark = GetFocusMarkTarget())
+    {
+        if (pVictim != pMark)
+        {
+            me->AttackStop(true);
+            AttackStart(pMark);
+            pVictim = pMark;
+        }
+
+        if (!m_singleFocus && pMark->GetVictim() == me)
+            if (Unit* pLoose = SelectLooseEnemy(slots))
+                if (TauntIfAllowed(pLoose, slots, otherTanks))
+                    return true;
+
+        return TauntIfAllowed(pMark, slots, otherTanks);
+    }
+
+    bool const grabLoose = !(mySlot == PB_TANK_SLOT_MT && otherTanks);
+    if (grabLoose &&
+       (!pVictim || pVictim->GetVictim() == me || GetSlotOf(slots, pVictim->GetVictim()) != PB_TANK_SLOT_NONE))
+    {
+        if (Unit* pLoose = SelectLooseEnemy(slots))
+        {
+            if (pLoose != pVictim)
+            {
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s (%s): grabs %s from %s", me->GetName(),
+                    GetTankSlotName(mySlot).c_str(), pLoose->GetName(),
+                    pLoose->GetVictim() ? pLoose->GetVictim()->GetName() : "nobody");
+                me->AttackStop(true);
+                AttackStart(pLoose);
+                pVictim = pLoose;
+            }
+        }
+    }
+
+    if (!pVictim)
+        return false;
+
+    return TauntIfAllowed(pVictim, slots, otherTanks);
+}
+
 void PartyBotAI::UpdateInCombatAI()
 {
     if (!IsInDuel())
     {
         if (m_role == ROLE_TANK)
         {
-            Unit* pVictim = me->GetVictim();
-
-            // Defend party members.
-            if (!pVictim || pVictim->GetVictim() == me)
-            {
-                if (pVictim = SelectPartyAttackTarget())
-                {
-                    me->AttackStop(true);
-                    AttackStart(pVictim);
-                }
-            }
-
-            // Taunt target if its attacking someone else.
-            if (pVictim && pVictim->GetVictim() != me)
-            {
-                for (const auto& pSpellEntry : m_spellListTaunt)
-                {
-                    if (CanTryToCastSpell(pVictim, pSpellEntry))
-                    {
-                        if (DoCastSpell(pVictim, pSpellEntry) == SPELL_CAST_OK)
-                            return;
-                    }
-                }
-            }
+            if (UpdateTankDuty())
+                return;
         }
         else if (CrowdControlMarkedTargets())
             return;

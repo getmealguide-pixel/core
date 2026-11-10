@@ -1997,6 +1997,7 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
 
     Unit* pTarget = nullptr;
     float healthPercent = 100.0f;
+    uint8 bestPriority = 0;
 
     if (Group* pGroup = me->GetGroup())
     {
@@ -2008,16 +2009,25 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
                 if (pMember == me)
                     continue;
 
+                uint8 const priority = GetHealPriority(pMember);
+
                 // Avoid all healers picking same target.
-                if (pTarget && !IsTankClass(pMember->GetClass()) && AreOthersOnSameTarget(pMember->GetObjectGuid(), false, true))
+                if (pTarget && !priority && !IsTankClass(pMember->GetClass()) && AreOthersOnSameTarget(pMember->GetObjectGuid(), false, true))
                     continue;
 
-                // Check if we should heal party member.
-                if ((IsValidHealTarget(pMember, groupHealPercent) &&
-                    healthPercent > pMember->GetHealthPercent()) ||
-                    // Or a pet if there are no injured players.
-                    (!pTarget && (pMember = pMember->GetPet()) &&
-                      IsValidHealTarget(pMember, groupHealPercent)))
+                // Check if we should heal party member: higher heal priority (tanks) first,
+                // then lowest health.
+                if (IsValidHealTarget(pMember, groupHealPercent) &&
+                   (priority > bestPriority ||
+                   (priority == bestPriority && healthPercent > pMember->GetHealthPercent())))
+                {
+                    healthPercent = pMember->GetHealthPercent();
+                    pTarget = pMember;
+                    bestPriority = priority;
+                }
+                // Or a pet if there are no injured players.
+                else if (!pTarget && (pMember = pMember->GetPet()) &&
+                          IsValidHealTarget(pMember, groupHealPercent))
                 {
                     healthPercent = pMember->GetHealthPercent();
                     pTarget = pMember;
@@ -2041,6 +2051,9 @@ Unit* CombatBotBaseAI::SelectPeriodicHealTarget(float selfHealPercent, float gro
     if (IsInDuel())
         return nullptr;
 
+    Unit* pTarget = nullptr;
+    uint8 bestPriority = 0;
+
     if (Group* pGroup = me->GetGroup())
     {
         for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
@@ -2051,15 +2064,20 @@ Unit* CombatBotBaseAI::SelectPeriodicHealTarget(float selfHealPercent, float gro
                 if (pMember == me)
                     continue;
 
-                // Check if we should heal party member.
-                if (IsValidHealTarget(pMember, groupHealPercent) &&
+                // Check if we should heal party member (higher heal priority first).
+                uint8 const priority = GetHealPriority(pMember);
+                if ((!pTarget || priority > bestPriority) &&
+                    IsValidHealTarget(pMember, groupHealPercent) &&
                    !pMember->HasAuraType(SPELL_AURA_PERIODIC_HEAL))
-                    return pMember;
+                {
+                    pTarget = pMember;
+                    bestPriority = priority;
+                }
             }
         }
     }
 
-    return nullptr;
+    return pTarget;
 }
 
 bool CombatBotBaseAI::FindAndPreHealTarget()

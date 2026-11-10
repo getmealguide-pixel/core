@@ -136,6 +136,8 @@ public:
     void BeginChasing(Unit* pVictim) const;
     // False while a higher-priority order (e.g. "stay") forbids the bot from moving on its own.
     virtual bool CanMoveOnOwn() const { return true; }
+    // Healing order among injured group members: higher first (e.g. main tank 2, off-tanks 1).
+    virtual uint8 GetHealPriority(Unit const* /*pUnit*/) const { return 0; }
     bool SummonShamanTotems();
     SpellCastResult CastWeaponBuff(SpellEntry const* pSpellEntry, EquipmentSlots slot);
     bool UseTrinketEffects(bool onlyToBreakCC = false);

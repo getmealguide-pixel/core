@@ -19,6 +19,8 @@
 #include "Utilities/Random.h"
 #include "Spell.h"
 
+#include <algorithm>
+
 INSTANTIATE_SINGLETON_1(PlayerBotMgr);
 
 
@@ -1117,6 +1119,8 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
         if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             pAI->m_role = role;
+            if (role != ROLE_TANK)
+                pAI->m_tankSlotManual = false;
             pAI->ResetSpellData();
             pAI->PopulateSpellData();
             PSendSysMessage("%s is now a %s.", pTarget->GetName(), roleStr.c_str());
@@ -1127,6 +1131,203 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
     SendSysMessage("Target is not a party bot.");
     SetSentErrorMessage(true);
     return false;
+}
+
+// .partybot slot mt|ot1..ot9|none|auto on the selected bot, or on yourself / another player.
+bool ChatHandler::HandlePartyBotSlotCommand(char* args)
+{
+    char* arg = ExtractArg(&args);
+    if (!arg)
+    {
+        SendSysMessage("Usage: .partybot slot mt|ot1..ot9|none|auto (on the selected bot or yourself).");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string slotStr = arg;
+    std::transform(slotStr.begin(), slotStr.end(), slotStr.begin(), ::tolower);
+
+    bool manual = true;
+    uint8 slot = PB_TANK_SLOT_NONE;
+    if (slotStr == "auto")
+        manual = false;
+    else if (slotStr == "mt")
+        slot = PB_TANK_SLOT_MT;
+    else if (slotStr.size() == 3 && slotStr.compare(0, 2, "ot") == 0 && slotStr[2] >= '1' && slotStr[2] <= '9')
+        slot = PB_TANK_SLOT_OT1 + (slotStr[2] - '1');
+    else if (slotStr != "none")
+    {
+        SendSysMessage("Unknown slot. Use mt, ot1..ot9, none or auto.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Player* pPlayer = GetSession()->GetPlayer();
+    Player* pTarget = GetSelectedPlayer(); // yourself when nothing is selected
+    if (!pTarget)
+    {
+        SendSysMessage(LANG_NO_CHAR_SELECTED);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Group* pGroup = pTarget->GetGroup();
+    if (!pGroup || pGroup != pPlayer->GetGroup())
+    {
+        SendSysMessage("Target is not in your group.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (slot != PB_TANK_SLOT_NONE && !CombatBotBaseAI::IsTankClass(pTarget->GetClass()))
+    {
+        PSendSysMessage("%s cannot tank (wrong class).", pTarget->GetName());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (manual && slot != PB_TANK_SLOT_NONE)
+        PartyBotAI::ClearManualTankSlot(pGroup, slot);
+
+    if (pTarget->AI())
+    {
+        PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget);
+        if (!pAI)
+        {
+            SendSysMessage("Target is not a party bot.");
+            SetSentErrorMessage(true);
+            return false;
+        }
+
+        // A bot given a slot becomes a tank; "none" turns it into damage dealer.
+        CombatBotRoles newRole = pAI->m_role;
+        if (manual && slot != PB_TANK_SLOT_NONE)
+            newRole = ROLE_TANK;
+        else if (manual)
+            newRole = CombatBotBaseAI::IsMeleeDamageClass(pTarget->GetClass()) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
+
+        pAI->m_tankSlotManual = manual && slot != PB_TANK_SLOT_NONE;
+        pAI->m_tankSlotChoice = slot;
+        if (newRole != pAI->m_role)
+        {
+            pAI->m_role = newRole;
+            pAI->ResetSpellData();
+            pAI->PopulateSpellData();
+        }
+    }
+    else
+        PartyBotAI::SetPlayerTankSlotChoice(pTarget->GetObjectGuid(), manual, slot);
+
+    if (!manual)
+        PSendSysMessage("%s: tank slot is automatic again.", pTarget->GetName());
+    else if (slot == PB_TANK_SLOT_NONE)
+        PSendSysMessage("%s: no tank slot%s.", pTarget->GetName(), pTarget->AI() ? " (now dps)" : "");
+    else
+        PSendSysMessage("%s is now %s.", pTarget->GetName(), PartyBotAI::GetTankSlotName(slot).c_str());
+
+    return true;
+}
+
+// .partybot slots: lists the current tank slots of your group.
+bool ChatHandler::HandlePartyBotSlotsCommand(char* /*args*/)
+{
+    Player* pPlayer = GetSession()->GetPlayer();
+    Group* pGroup = pPlayer->GetGroup();
+    if (!pGroup)
+    {
+        SendSysMessage("You are not in a group.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    PartyBotTankSlotMap slots;
+    PartyBotAI::ResolveTankSlots(pGroup, slots);
+
+    std::vector<std::pair<uint8, ObjectGuid>> ordered;
+    for (auto const& itr : slots)
+        ordered.emplace_back(itr.second, itr.first);
+    std::sort(ordered.begin(), ordered.end());
+
+    if (ordered.empty())
+    {
+        SendSysMessage("No tanks in the group.");
+        return true;
+    }
+
+    for (auto const& itr : ordered)
+    {
+        Player* pMember = sObjectMgr.GetPlayer(itr.second);
+        if (!pMember)
+            continue;
+
+        char const* how = "auto";
+        bool singleFocus = false;
+        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+        {
+            if (pAI->m_tankSlotManual)
+                how = "set";
+            singleFocus = pAI->m_singleFocus;
+        }
+        else
+        {
+            uint8 choice;
+            if (PartyBotAI::GetPlayerTankSlotChoice(pMember->GetObjectGuid(), choice))
+                how = "set";
+        }
+
+        PSendSysMessage("%s: %s (%s%s)", PartyBotAI::GetTankSlotName(itr.first).c_str(),
+            pMember->GetName(), how, singleFocus ? ", single focus" : "");
+    }
+    return true;
+}
+
+// .partybot singlefocus on|off [all]: tank only its focus mark (on) or also loose enemies (off).
+// A selected bot wins over "all".
+bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
+{
+    char* arg1 = ExtractArg(&args);
+    char* arg2 = ExtractArg(&args);
+    if (!arg1 || (strcmp(arg1, "on") != 0 && strcmp(arg1, "off") != 0))
+    {
+        SendSysMessage("Usage: .partybot singlefocus on|off [all]");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    bool const on = strcmp(arg1, "on") == 0;
+    bool const all = arg2 && strcmp(arg2, "all") == 0;
+    Player* pPlayer = GetSession()->GetPlayer();
+
+    Player* pTarget = GetSelectedPlayer();
+    if (pTarget && pTarget != pPlayer && dynamic_cast<PartyBotAI*>(pTarget->AI()))
+    {
+        GetCommandedPartyBotAI(pTarget)->m_singleFocus = on;
+        PSendSysMessage("%s single focus %s.", pTarget->GetName(), on ? "on" : "off");
+        return true;
+    }
+
+    if (!all)
+    {
+        SendSysMessage("Select a party bot or add 'all'.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Group* pGroup = pPlayer->GetGroup();
+    if (!pGroup)
+    {
+        SendSysMessage("You are not in a group.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+        if (Player* pMember = itr->getSource())
+            if (pMember != pPlayer && dynamic_cast<PartyBotAI*>(pMember->AI()))
+                GetCommandedPartyBotAI(pMember)->m_singleFocus = on;
+
+    PSendSysMessage("All party bots single focus %s.", on ? "on" : "off");
+    return true;
 }
 
 bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
