@@ -96,6 +96,12 @@ public:
     void LearnPremadeSpecForClass();
     void EquipPremadeGearTemplate();
     void EquipRandomGearInEmptySlots();
+    // Basic usability filter shared by the gear pickers (level, class, skill, reputation...).
+    bool IsUsableGearCandidate(ItemPrototype const* pProto, bool onlyPvE, uint8 honorRank) const;
+    // Scored gear for the bot's class, role and level; replaces everything equipped.
+    void EquipRoleGear();
+    // Score of an item for the bot's class and role; negative = unsuitable.
+    float GetRoleGearScore(ItemPrototype const* pProto) const;
     void AutoEquipGear(uint32 option);
     void LearnRandomTalents(uint32 forcedTab = UINT32_MAX); // forcedTab: talent tree to use, else random
     
@@ -608,6 +614,7 @@ public:
 
     bool m_initialized = false;
     bool m_isBuffing = false;
+    uint8 m_weaponStyle = 0; // melee that can do both: 0 undecided, 1 two-hander, 2 dual wield
     bool m_preventCasting = false;
     bool m_receivedBgInvite = false;
     uint8 m_visualHonorRank = 0;

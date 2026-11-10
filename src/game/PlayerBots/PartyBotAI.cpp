@@ -291,10 +291,15 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
        (pSpellEntry->HasEffect(SPELL_EFFECT_CHARGE) || pSpellEntry->HasEffect(SPELL_EFFECT_LEAP)))
         return false;
 
-    // Stacked and moving with the leader: only instant spells (a cast would be interrupted by moving).
-    if (m_followMode == PB_FOLLOW_STACKED && !m_holdPosition && me->IsMoving() &&
-       (pSpellEntry->IsChanneledSpell() || pSpellEntry->GetCastTime(me) > 0))
-        return false;
+    // Following a moving leader (toggle: always; other follow modes: out of combat): only
+    // instant spells, a cast would stop the bot. Instant spells and buffs stay allowed.
+    if (!m_holdPosition && (pSpellEntry->IsChanneledSpell() || pSpellEntry->GetCastTime(me) > 0) &&
+       (m_followMode == PB_FOLLOW_STACKED || !me->IsInCombat()))
+    {
+        Player const* pLeader = GetPartyLeader();
+        if (me->IsMoving() || (pLeader && pLeader->IsMoving()))
+            return false;
+    }
 
     if (pSpellEntry->IsAreaOfEffectSpell() && !pSpellEntry->IsPositiveSpell() && !IsInDuel())
     {
@@ -631,7 +636,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 {
     if (m_initialized && me->IsInWorld())
     {
-        if (m_followMode == PB_FOLLOW_STACKED && !m_holdPosition)
+        // Toggle: always; other follow modes: out of combat (a cast must not hold the bot back).
+        if (!m_holdPosition && (m_followMode == PB_FOLLOW_STACKED || !me->IsInCombat()))
             ReactToLeaderMovement();
 
         if (!m_holdPosition)
@@ -679,7 +685,11 @@ void PartyBotAI::UpdateAI(uint32 const diff)
                 LearnSpellsAndTalentsForLevel(true);
                 me->SetPersonalXpRate(0.0f);
 
-                AutoEquipGear(sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_AUTO_EQUIP));
+                // Random/premade setting: scored gear for class, role and level instead.
+                if (sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_AUTO_EQUIP) == PLAYER_BOT_AUTO_EQUIP_STARTING_GEAR)
+                    AutoEquipGear(PLAYER_BOT_AUTO_EQUIP_STARTING_GEAR);
+                else
+                    EquipRoleGear();
 
                 // fix client bug causing some item slots to not be visible
                 if (Player* pLeader = GetPartyLeader())
@@ -885,13 +895,21 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (!me->IsInCombat() && !me->IsMounted())
     {
+        // Buffs and other instant spells always go out. While the leader moves (not on stay)
+        // cast-time spells are refused (CanTryToCastSpell) and the bot keeps following instead
+        // of waiting for its buff global cooldown.
         UpdateOutOfCombatAI();
 
-        if (m_isBuffing)
-            return;
+        if (mayFollow && pLeader->IsMoving())
+            m_isBuffing = false;
+        else
+        {
+            if (m_isBuffing)
+                return;
 
-        if (me->IsNonMeleeSpellCasted())
-            return;
+            if (me->IsNonMeleeSpellCasted())
+                return;
+        }
     }
 
     Unit* pVictim = me->GetVictim();
@@ -1143,8 +1161,9 @@ void PartyBotAI::FaceCombatTarget()
         me->SetFacingToObject(pTarget);
 }
 
-// Toggle: checked every world tick. When the leader starts moving, drop any cast that would
-// keep the bot in place and run the full AI on the next tick so it follows at once.
+// Checked every world tick (toggle: always; other follow modes: out of combat). When the leader
+// starts moving, drop any cast that would keep the bot in place and run the full AI on the next
+// tick so it follows at once.
 void PartyBotAI::ReactToLeaderMovement()
 {
     Player* pLeader = GetPartyLeader();
@@ -1434,6 +1453,8 @@ void PartyBotAI::SyncLevelWithLeader(Player const* pLeader)
     me->SetUInt32Value(PLAYER_XP, 0);
     LearnSpellsAndTalentsForLevel(false);
     me->UpdateSkillsToMaxSkillsForLevel();
+    if (sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_AUTO_EQUIP) != PLAYER_BOT_AUTO_EQUIP_STARTING_GEAR)
+        EquipRoleGear(); // regear for the new level
 
     ResetSpellData();
     PopulateSpellData();

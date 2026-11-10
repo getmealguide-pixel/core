@@ -2624,70 +2624,17 @@ void CombatBotBaseAI::EquipRandomGearInEmptySlots()
     {
         ItemPrototype const* pProto = &itr.second;
 
-        // Only items that have already been discovered by someone
-        if (!pProto->Discovered)
+        if (!IsUsableGearCandidate(pProto, onlyPvE, honorRank))
             continue;
 
-        // Skip unobtainable items
-        if (pProto->HasExtraFlag(ITEM_EXTRA_NOT_OBTAINABLE))
-            continue;
-
-        // Only gear and weapons
-        if (pProto->Class != ITEM_CLASS_WEAPON && pProto->Class != ITEM_CLASS_ARMOR)
-            continue;
-
-        // No tabards and shirts
-        if (pProto->InventoryType == INVTYPE_TABARD || pProto->InventoryType == INVTYPE_BODY)
-            continue;
-
-        if (pProto->SourceQuestRaces && !(pProto->SourceQuestRaces & me->GetRaceMask()))
-            continue;
-
-        if (pProto->SourceQuestClasses && !(pProto->SourceQuestClasses & me->GetClassMask()))
-            continue;
-
-        if (pProto->SourceQuestLevel < 0)
-        {
-            // Avoid higher level items with no level requirement
-            if (!pProto->RequiredLevel && pProto->ItemLevel > me->GetLevel())
-                continue;
-        }
-        else
-        {
-            // Item is from a high level quest
-            if (uint32(pProto->SourceQuestLevel) > me->GetLevel())
-                continue;
-        }
-
-        // Avoid low level items
-        if ((pProto->ItemLevel + sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_RANDOM_GEAR_LEVEL_DIFFERENCE)) < me->GetLevel())
-            continue;
-
-        if (me->CanUseItem(pProto, onlyPvE) != EQUIP_ERR_OK)
-            continue;
-
-        if (pProto->RequiredHonorRank > honorRank)
-            continue;
-
-        if (pProto->RequiredReputationFaction && uint32(me->GetReputationRank(pProto->RequiredReputationFaction)) < pProto->RequiredReputationRank)
-            continue;
-
+        // Don't equip cloth items on warriors, etc unless bot is a healer
         if (uint32 skill = pProto->GetProficiencySkill())
-        {
-            // Don't equip cloth items on warriors, etc unless bot is a healer
             if (pProto->Class == ITEM_CLASS_ARMOR &&
                 pProto->InventoryType != INVTYPE_CLOAK &&
                 pProto->InventoryType != INVTYPE_SHIELD &&
                 skill != me->GetHighestKnownArmorProficiency() &&
                 m_role != ROLE_HEALER)
                 continue;
-
-            // Fist weapons use unarmed skill calculations, but we must query fist weapon skill presence to use this item
-            if (pProto->SubClass == ITEM_SUBCLASS_WEAPON_FIST)
-                skill = SKILL_FIST_WEAPONS;
-            if (!me->GetSkillValue(skill))
-                continue;
-        }
 
         uint8 slots[4];
         pProto->GetAllowedEquipSlots(slots, me->GetClass(), me->CanDualWield());
@@ -2804,6 +2751,367 @@ void CombatBotBaseAI::EquipRandomGearInEmptySlots()
         me->SatisfyItemRequirements(pProto);
         me->StoreNewItemInBestSlots(pProto->ItemId, 1);
     }
+}
+
+bool CombatBotBaseAI::IsUsableGearCandidate(ItemPrototype const* pProto, bool onlyPvE, uint8 honorRank) const
+{
+    // Only items that have already been discovered by someone
+    if (!pProto->Discovered)
+        return false;
+
+    // Skip unobtainable items
+    if (pProto->HasExtraFlag(ITEM_EXTRA_NOT_OBTAINABLE))
+        return false;
+
+    // Only gear and weapons
+    if (pProto->Class != ITEM_CLASS_WEAPON && pProto->Class != ITEM_CLASS_ARMOR)
+        return false;
+
+    // No tabards and shirts
+    if (pProto->InventoryType == INVTYPE_TABARD || pProto->InventoryType == INVTYPE_BODY)
+        return false;
+
+    if (pProto->SourceQuestRaces && !(pProto->SourceQuestRaces & me->GetRaceMask()))
+        return false;
+
+    if (pProto->SourceQuestClasses && !(pProto->SourceQuestClasses & me->GetClassMask()))
+        return false;
+
+    if (pProto->SourceQuestLevel < 0)
+    {
+        // Avoid higher level items with no level requirement
+        if (!pProto->RequiredLevel && pProto->ItemLevel > me->GetLevel())
+            return false;
+    }
+    else
+    {
+        // Item is from a high level quest
+        if (uint32(pProto->SourceQuestLevel) > me->GetLevel())
+            return false;
+    }
+
+    // Avoid low level items
+    if ((pProto->ItemLevel + sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_RANDOM_GEAR_LEVEL_DIFFERENCE)) < me->GetLevel())
+        return false;
+
+    if (me->CanUseItem(pProto, onlyPvE) != EQUIP_ERR_OK)
+        return false;
+
+    if (pProto->RequiredHonorRank > honorRank)
+        return false;
+
+    if (pProto->RequiredReputationFaction && uint32(me->GetReputationRank(pProto->RequiredReputationFaction)) < pProto->RequiredReputationRank)
+        return false;
+
+    if (uint32 skill = pProto->GetProficiencySkill())
+    {
+        // Fist weapons use unarmed skill calculations, but we must query fist weapon skill presence to use this item
+        if (pProto->SubClass == ITEM_SUBCLASS_WEAPON_FIST)
+            skill = SKILL_FIST_WEAPONS;
+        if (!me->GetSkillValue(skill))
+            return false;
+    }
+
+    return true;
+}
+
+namespace
+{
+    struct RoleGearWeights
+    {
+        float strength, agility, stamina, intellect, spirit, armor, meleeDps, rangedDps;
+        bool caster; // casters and healers: no strength/agility items
+    };
+
+    RoleGearWeights GetRoleGearWeights(uint8 playerClass, CombatBotRoles role)
+    {
+        switch (role)
+        {
+            case ROLE_TANK:
+                // Druids fight in bear/cat form: weapon damage does not count, only stats.
+                if (playerClass == CLASS_DRUID)
+                    return { 0.7f, 1.0f, 1.5f, 0.0f, 0.0f, 0.04f, 0.0f, 0.0f, false };
+                return { 1.0f, 0.7f, 1.5f, playerClass == CLASS_PALADIN ? 0.2f : 0.0f, 0.0f, 0.04f, 1.0f, 0.2f, false };
+            case ROLE_HEALER:
+                return { 0.0f, 0.0f, 0.4f, 1.5f, 1.0f, 0.005f, 0.0f, 0.5f, true };
+            case ROLE_RANGE_DPS:
+                if (playerClass == CLASS_HUNTER)
+                    return { 0.2f, 1.5f, 0.5f, 0.4f, 0.0f, 0.01f, 0.5f, 3.0f, false };
+                return { 0.0f, 0.0f, 0.5f, 1.5f, 0.4f, 0.005f, 0.0f, 1.0f, true };
+            default: // melee dps
+                switch (playerClass)
+                {
+                    case CLASS_ROGUE:
+                        return { 0.8f, 1.5f, 0.5f, 0.0f, 0.0f, 0.01f, 3.0f, 0.3f, false };
+                    case CLASS_DRUID: // cat form: stats only
+                        return { 0.8f, 1.5f, 0.5f, 0.0f, 0.0f, 0.01f, 0.0f, 0.0f, false };
+                    case CLASS_SHAMAN:
+                        return { 1.3f, 1.0f, 0.5f, 0.3f, 0.0f, 0.01f, 3.0f, 0.0f, false };
+                    case CLASS_HUNTER:
+                        return { 0.2f, 1.5f, 0.5f, 0.4f, 0.0f, 0.01f, 0.5f, 3.0f, false };
+                    default:
+                        return { 1.5f, 1.0f, 0.5f, 0.0f, 0.0f, 0.01f, 3.0f, 0.3f, false };
+                }
+        }
+    }
+
+    bool IsRangedSlotType(uint32 inventoryType)
+    {
+        return inventoryType == INVTYPE_RANGED || inventoryType == INVTYPE_RANGEDRIGHT || inventoryType == INVTYPE_THROWN;
+    }
+
+    bool IsOneHandWeaponType(uint32 inventoryType)
+    {
+        return inventoryType == INVTYPE_WEAPON || inventoryType == INVTYPE_WEAPONMAINHAND;
+    }
+}
+
+float CombatBotBaseAI::GetRoleGearScore(ItemPrototype const* pProto) const
+{
+    RoleGearWeights const w = GetRoleGearWeights(me->GetClass(), m_role);
+
+    // Junk: poor quality, profession gear (needs or raises a profession, e.g. fishing hats).
+    if (pProto->Quality == ITEM_QUALITY_POOR || pProto->RequiredSkill)
+        return -1.0f;
+    for (auto const& itemSpell : pProto->Spells)
+        if (SpellEntry const* pSpell = sSpellMgr.GetSpellEntry(itemSpell.SpellId))
+            for (uint32 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (pSpell->EffectApplyAuraName[i] == SPELL_AURA_MOD_SKILL ||
+                    pSpell->EffectApplyAuraName[i] == SPELL_AURA_MOD_SKILL_TALENT)
+                    return -1.0f;
+
+    // Armor type: the best one the class knows (cloaks, shields, jewelry, off-hands excluded).
+    if (pProto->Class == ITEM_CLASS_ARMOR && pProto->InventoryType != INVTYPE_CLOAK &&
+        pProto->InventoryType != INVTYPE_SHIELD)
+        if (uint32 skill = pProto->GetProficiencySkill())
+            if (skill != me->GetHighestKnownArmorProficiency())
+                return -1.0f;
+
+    // Shields: tanks, and casters/healers of shield classes. Off-hand frills: casters only.
+    if (pProto->InventoryType == INVTYPE_SHIELD && m_role != ROLE_TANK && !w.caster)
+        return -1.0f;
+    if (pProto->InventoryType == INVTYPE_HOLDABLE && !w.caster)
+        return -1.0f;
+
+    float strength = 0, agility = 0, stamina = 0, intellect = 0, spirit = 0;
+    for (auto const& stat : pProto->ItemStat)
+    {
+        switch (stat.ItemStatType)
+        {
+            case ITEM_MOD_STRENGTH: strength += stat.ItemStatValue; break;
+            case ITEM_MOD_AGILITY: agility += stat.ItemStatValue; break;
+            case ITEM_MOD_STAMINA: stamina += stat.ItemStatValue; break;
+            case ITEM_MOD_INTELLECT: intellect += stat.ItemStatValue; break;
+            case ITEM_MOD_SPIRIT: spirit += stat.ItemStatValue; break;
+        }
+    }
+
+    // Wrong stats: casters never take strength/agility; physical roles never take caster-only items.
+    if (w.caster && (strength > 0 || agility > 0))
+        return -1.0f;
+    if (!w.caster && w.intellect < 0.3f && (intellect > 0 || spirit > 0) && strength <= 0 && agility <= 0)
+        return -1.0f;
+
+    float const statScore = strength * w.strength + agility * w.agility + stamina * w.stamina +
+                            intellect * w.intellect + spirit * w.spirit;
+
+    // Trinkets only when they actually help the role (no pure on-use novelty trinkets).
+    if (pProto->InventoryType == INVTYPE_TRINKET && statScore <= 0)
+        return -1.0f;
+
+    float score = statScore + pProto->Armor * w.armor;
+
+    if (pProto->Class == ITEM_CLASS_WEAPON && pProto->Delay)
+    {
+        float damage = 0;
+        for (auto const& dmg : pProto->Damage)
+            damage += (dmg.DamageMin + dmg.DamageMax) / 2.0f;
+        float const dps = damage * 1000.0f / pProto->Delay;
+        score += dps * (IsRangedSlotType(pProto->InventoryType) ? w.rangedDps : w.meleeDps);
+    }
+
+    return score;
+}
+
+// Picks scored gear for every slot and replaces what the bot wears. Level 60 and up: the
+// class/role pre-raid BiS template when one exists (never the raid BiS one).
+void CombatBotBaseAI::EquipRoleGear()
+{
+    LearnArmorProficiencies();
+
+    bool const maxLevel = me->GetLevel() >= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
+    if (maxLevel)
+    {
+        for (auto const& itr : sObjectMgr.GetPlayerPremadeGearTemplates())
+        {
+            if (itr.second.requiredClass == me->GetClass() && itr.second.role == m_role &&
+                itr.second.level == me->GetLevel() && itr.second.name.find("preraid") != std::string::npos)
+            {
+                for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+                    if (me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                        me->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+                sObjectMgr.ApplyPremadeGearTemplateToPlayer(itr.first, me);
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Gear] %s: pre-raid set '%s'", me->GetName(), itr.second.name.c_str());
+                return;
+            }
+        }
+    }
+
+    // Candidates per slot, best first.
+    std::map<uint8, std::vector<std::pair<float, ItemPrototype const*>>> candidates;
+    for (auto const& itr : sObjectMgr.GetItemPrototypeMap())
+    {
+        ItemPrototype const* pProto = &itr.second;
+
+        if (!IsUsableGearCandidate(pProto, true, 0))
+            continue;
+
+        // No pre-raid set for this spec at max level: keep raid gear out.
+        if (maxLevel && pProto->ItemLevel > 63)
+            continue;
+
+        float const score = GetRoleGearScore(pProto);
+        if (score < 0)
+            continue;
+
+        uint8 slots[4];
+        pProto->GetAllowedEquipSlots(slots, me->GetClass(), me->CanDualWield());
+        for (uint8 slot : slots)
+            if (slot >= EQUIPMENT_SLOT_START && slot < EQUIPMENT_SLOT_END)
+                candidates[slot].push_back({ score, pProto });
+    }
+    for (auto& itr : candidates)
+        std::sort(itr.second.begin(), itr.second.end(),
+            [](std::pair<float, ItemPrototype const*> const& a, std::pair<float, ItemPrototype const*> const& b) { return a.first > b.first; });
+
+    // One of the top 3 items within 90% of the best score (a little variety); filter decides
+    // which items of the slot qualify; excluded item ids are skipped (unique second ring etc.).
+    auto pick = [&](uint8 slot, auto filter, uint32 excludeId) -> std::pair<float, ItemPrototype const*>
+    {
+        std::vector<std::pair<float, ItemPrototype const*>> top;
+        for (auto const& entry : candidates[slot])
+        {
+            if (entry.second->ItemId == excludeId || !filter(entry.second))
+                continue;
+            if (!top.empty() && entry.first < top.front().first * 0.9f)
+                break;
+            top.push_back(entry);
+            if (top.size() == 3)
+                break;
+        }
+        if (top.empty())
+            return { 0.0f, nullptr };
+        return SelectRandomContainerElement(top);
+    };
+    auto any = [](ItemPrototype const*) { return true; };
+
+
+    // Weapons by role.
+    RoleGearWeights const w = GetRoleGearWeights(me->GetClass(), m_role);
+    auto is2H = [](ItemPrototype const* p) { return p->InventoryType == INVTYPE_2HWEAPON; };
+    auto is1H = [](ItemPrototype const* p) { return IsOneHandWeaponType(p->InventoryType); };
+    auto isShield = [](ItemPrototype const* p) { return p->InventoryType == INVTYPE_SHIELD; };
+    // Off-hand weapons only for classes that can dual wield (druids never).
+    bool const canDualWield = me->CanDualWield();
+    auto offhandForRole = [&](ItemPrototype const* p)
+    {
+        if (w.caster)
+            return p->InventoryType == INVTYPE_HOLDABLE || p->InventoryType == INVTYPE_SHIELD;
+        return canDualWield && (p->InventoryType == INVTYPE_WEAPON || p->InventoryType == INVTYPE_WEAPONOFFHAND);
+    };
+
+    auto const twoHand = pick(EQUIPMENT_SLOT_MAINHAND, is2H, 0);
+    auto const oneHand = pick(EQUIPMENT_SLOT_MAINHAND, is1H, 0);
+    ItemPrototype const* pNewMainHand = nullptr;
+    ItemPrototype const* pNewOffHand = nullptr;
+    float newWeaponScore = 0.0f;
+    if (m_role == ROLE_TANK && IsShieldClass(me->GetClass()))
+    {
+        // Tanks with shields: always one-hand + shield.
+        auto const shield = pick(EQUIPMENT_SLOT_OFFHAND, isShield, 0);
+        pNewMainHand = oneHand.second;
+        pNewOffHand = shield.second;
+        newWeaponScore = oneHand.first + shield.first;
+    }
+    else
+    {
+        auto const offHand = pick(EQUIPMENT_SLOT_OFFHAND, offhandForRole,
+            oneHand.second && oneHand.second->MaxCount == 1 ? oneHand.second->ItemId : 0);
+        float const pairScore = oneHand.first + offHand.first;
+
+        // Melee that can use both: a fixed per-bot mix of two-handers and dual wielding (two
+        // weapons always out-score one, so a pure score comparison would make everyone dual wield).
+        bool useTwoHand = twoHand.second && twoHand.first >= pairScore;
+        if (!w.caster && canDualWield && twoHand.second && oneHand.second && offHand.second)
+        {
+            if (!m_weaponStyle)
+                m_weaponStyle = urand(1, 2);
+            useTwoHand = m_weaponStyle == 1;
+        }
+
+        if (useTwoHand)
+        {
+            pNewMainHand = twoHand.second;
+            newWeaponScore = twoHand.first;
+        }
+        else
+        {
+            pNewMainHand = oneHand.second;
+            pNewOffHand = offHand.second;
+            newWeaponScore = pairScore;
+        }
+    }
+
+    // A slot is only changed when the new item scores higher than what is worn (empty or
+    // unsuitable counts as -1), so nothing good is ever taken away.
+    auto wornScore = [&](uint8 slot) -> float
+    {
+        Item* pItem = me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!pItem)
+            return -1.0f;
+        return std::max(-1.0f, GetRoleGearScore(pItem->GetProto()));
+    };
+    auto equip = [&](uint8 slot, ItemPrototype const* pProto)
+    {
+        if (me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            me->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+        if (!pProto)
+            return false;
+        me->SatisfyItemRequirements(pProto);
+        uint16 dest;
+        return me->CanEquipNewItem(slot, dest, pProto->ItemId, false) == EQUIP_ERR_OK &&
+               me->EquipNewItem(dest, pProto->ItemId, true);
+    };
+
+    uint32 changed = 0;
+
+    // Weapons as one set (two-hander vs one-hand + off-hand).
+    float const wornWeaponScore = wornScore(EQUIPMENT_SLOT_MAINHAND) +
+        (me->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND) ? wornScore(EQUIPMENT_SLOT_OFFHAND) : 0.0f);
+    if (pNewMainHand && newWeaponScore > wornWeaponScore)
+    {
+        changed += equip(EQUIPMENT_SLOT_MAINHAND, pNewMainHand);
+        changed += equip(EQUIPMENT_SLOT_OFFHAND, pNewOffHand);
+    }
+
+    // Everything else; rings and trinkets twice without the same item twice.
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        if (slot == EQUIPMENT_SLOT_MAINHAND || slot == EQUIPMENT_SLOT_OFFHAND)
+            continue;
+
+        uint32 exclude = 0;
+        if (slot == EQUIPMENT_SLOT_FINGER2 || slot == EQUIPMENT_SLOT_TRINKET2)
+            if (Item* pFirst = me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot - 1))
+                exclude = pFirst->GetEntry();
+
+        auto const item = pick(slot, any, exclude);
+        if (item.second && item.first > wornScore(slot))
+            changed += equip(slot, item.second);
+    }
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Gear] %s: %u slots upgraded for %s at level %u", me->GetName(),
+        changed, GetRoleName(m_role), me->GetLevel());
 }
 
 void CombatBotBaseAI::AutoEquipGear(uint32 option)
