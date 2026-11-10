@@ -3427,6 +3427,8 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
         }
 
         // Sunder Armor: stack to the maximum (5), then refresh shortly before it runs out.
+        // While a Sunder is due and the tank is in reach, rage is saved for it (see below).
+        bool saveRageForSunder = false;
         if (m_spells.warrior.pSunderArmor && m_role == ROLE_TANK)
         {
             uint32 stacks = 0;
@@ -3438,7 +3440,11 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
             }
             uint32 const maxStacks = std::max<uint32>(1, m_spells.warrior.pSunderArmor->GetStackAmount());
 
-            if ((stacks < maxStacks || remaining < PB_SUNDER_REFRESH_MS) &&
+            bool const sunderDue = stacks < maxStacks || remaining < PB_SUNDER_REFRESH_MS;
+            saveRageForSunder = sunderDue && me->CanReachWithMeleeAutoAttack(pVictim) &&
+                me->GetPower(POWER_RAGE) < Spell::CalculatePowerCost(m_spells.warrior.pSunderArmor, me);
+
+            if (sunderDue &&
                 CanTryToCastSpell(pVictim, m_spells.warrior.pSunderArmor) &&
                 DoCastSpell(pVictim, m_spells.warrior.pSunderArmor) == SPELL_CAST_OK)
             {
@@ -3489,6 +3495,11 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
                     return;
             }
         }
+
+        // Not enough rage for a due Sunder: spend nothing else (Revenge, Shield Block when hurt and
+        // taunts above still go out), auto-attack builds the rage.
+        if (saveRageForSunder)
+            return;
 
         if (m_spells.warrior.pThunderClap &&
             m_role == ROLE_TANK &&
@@ -3614,8 +3625,10 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
                 return;
         }
 
+        // Self-cast area debuff: the "aura already on target" rule checks the caster, so check the enemy.
         if (m_spells.warrior.pDemoralizingShout &&
             m_role == ROLE_TANK &&
+           !pVictim->HasAura(m_spells.warrior.pDemoralizingShout->Id) &&
             CanTryToCastSpell(me, m_spells.warrior.pDemoralizingShout))
         {
             if (DoCastSpell(me, m_spells.warrior.pDemoralizingShout) == SPELL_CAST_OK)
