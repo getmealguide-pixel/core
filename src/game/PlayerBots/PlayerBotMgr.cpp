@@ -1085,6 +1085,33 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
     if (role == ROLE_INVALID)
         return false;
 
+    uint8 const botClass = pTarget->GetClass();
+    bool classCanDoRole = false;
+    switch (role)
+    {
+        case ROLE_TANK:
+            classCanDoRole = CombatBotBaseAI::IsTankClass(botClass);
+            break;
+        case ROLE_HEALER:
+            classCanDoRole = CombatBotBaseAI::IsHealerClass(botClass);
+            break;
+        case ROLE_MELEE_DPS:
+            classCanDoRole = CombatBotBaseAI::IsMeleeDamageClass(botClass);
+            break;
+        case ROLE_RANGE_DPS:
+            classCanDoRole = CombatBotBaseAI::IsRangedDamageClass(botClass);
+            break;
+        default:
+            break;
+    }
+
+    if (!classCanDoRole)
+    {
+        PSendSysMessage("%s cannot be a %s (wrong class).", pTarget->GetName(), roleStr.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
     if (pTarget->AI())
     {
         if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
@@ -1624,6 +1651,12 @@ bool ChatHandler::HandlePartyBotPauseHelper(char* args, bool pause)
     if (pause && !duration)
         duration = 5 * MINUTE * IN_MILLISECONDS;
 
+    // A selected party bot always wins over "all" (same rule as the movement orders).
+    if (all)
+        if (Player* pTarget = GetSelectedPlayer())
+            if (pTarget != GetSession()->GetPlayer() && dynamic_cast<PartyBotAI*>(pTarget->AI()))
+                all = false;
+
     if (all)
     {
         Player* pPlayer = GetSession()->GetPlayer();
@@ -1735,7 +1768,14 @@ bool ChatHandler::HandlePartyBotMoveOrderHelper(char* args, uint8 order)
     Player* pPlayer = GetSession()->GetPlayer();
     std::vector<Player*> bots;
 
-    if (all)
+    // A selected party bot always wins over "all", so one macro serves both cases.
+    Player* pTarget = GetSelectedPlayer();
+    if (pTarget && pTarget != pPlayer && dynamic_cast<PartyBotAI*>(pTarget->AI()))
+    {
+        all = false;
+        bots.push_back(pTarget);
+    }
+    else if (all)
     {
         Group* pGroup = pPlayer->GetGroup();
         if (!pGroup)
@@ -1756,23 +1796,16 @@ bool ChatHandler::HandlePartyBotMoveOrderHelper(char* args, uint8 order)
             return true;
         }
     }
+    else if (!pTarget)
+    {
+        SendSysMessage(LANG_NO_CHAR_SELECTED);
+        SetSentErrorMessage(true);
+        return false;
+    }
     else
     {
-        Player* pTarget = GetSelectedPlayer();
-        if (!pTarget)
-        {
-            SendSysMessage(LANG_NO_CHAR_SELECTED);
-            SetSentErrorMessage(true);
-            return false;
-        }
-
-        if (!dynamic_cast<PartyBotAI*>(pTarget->AI()))
-        {
-            SendSysMessage("Target is not a party bot.");
-            return true;
-        }
-
-        bots.push_back(pTarget);
+        SendSysMessage("Target is not a party bot.");
+        return true;
     }
 
     // Toggle: if any of the commanded bots is not stacked yet, stack them all; otherwise unstack.
