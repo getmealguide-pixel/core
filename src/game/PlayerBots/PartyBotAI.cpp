@@ -54,7 +54,9 @@ enum PartyBotSpells
 #define PB_TANK_SAFE_LEAD 1.5f       // tank threat >= this x anyone else's = enemy is safe
 #define PB_TANK_DANGER_LEAD 1.15f    // tank threat below this x someone else's = about to switch
 #define PB_TANK_THREAT_FLOOR 10.0f
-#define PB_SUNDER_REFRESH_MS 5000    // re-apply a full Sunder Armor stack with this much time left   // per tank level: threat counted as "anyone else" at minimum
+#define PB_SUNDER_REFRESH_MS 5000
+#define PB_SHIELD_BLOCK_HEALTH_PCT 60.0f // tank Shield Block when below this health...
+#define PB_SHIELD_BLOCK_SPARE_RAGE 400   // ...or with this much rage (x10) to spare    // re-apply a full Sunder Armor stack with this much time left   // per tank level: threat counted as "anyone else" at minimum
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -3409,49 +3411,19 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
                 return;
         }
 
-        if (me->GetShapeshiftForm() == FORM_DEFENSIVESTANCE &&
-            IsWearingShield(me))
-        {
-            if (!me->GetAttackers().empty())
-            {
-                if (m_spells.warrior.pShieldBlock &&
-                    CanTryToCastSpell(me, m_spells.warrior.pShieldBlock))
-                {
-                    if (DoCastSpell(me, m_spells.warrior.pShieldBlock) == SPELL_CAST_OK)
-                        return;
-                }
-
-                if (m_spells.warrior.pShieldWall &&
-                   (me->GetHealthPercent() < 40.0f) &&
-                    CanTryToCastSpell(me, m_spells.warrior.pShieldWall))
-                {
-                    if (DoCastSpell(me, m_spells.warrior.pShieldWall) == SPELL_CAST_OK)
-                        return;
-                }
-            }
-
-            if (m_spells.warrior.pShieldSlam &&
-                CanTryToCastSpell(pVictim, m_spells.warrior.pShieldSlam))
-            {
-                if (DoCastSpell(pVictim, m_spells.warrior.pShieldSlam) == SPELL_CAST_OK)
-                    return;
-            }
-        }
-
+        // Tank rage order: Revenge (cheap, most threat) > Sunder stacks > Shield Block only when
+        // hurt or with spare rage, so Shield Block cannot starve Sunder of rage.
         // Revenge: Defensive Stance, after a block/dodge/parry (aura state checked by the cast rules).
         if (m_spells.warrior.pRevenge &&
             CanTryToCastSpell(pVictim, m_spells.warrior.pRevenge))
         {
             if (DoCastSpell(pVictim, m_spells.warrior.pRevenge) == SPELL_CAST_OK)
+            {
+                if (m_role == ROLE_TANK)
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Revenge on %s (rage %u)",
+                        me->GetName(), pVictim->GetName(), me->GetPower(POWER_RAGE) / 10);
                 return;
-        }
-
-        if (m_spells.warrior.pThunderClap &&
-            m_role == ROLE_TANK &&
-            CanTryToCastSpell(pVictim, m_spells.warrior.pThunderClap))
-        {
-            if (DoCastSpell(pVictim, m_spells.warrior.pThunderClap) == SPELL_CAST_OK)
-                return;
+            }
         }
 
         // Sunder Armor: stack to the maximum (5), then refresh shortly before it runs out.
@@ -3471,13 +3443,58 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
                 DoCastSpell(pVictim, m_spells.warrior.pSunderArmor) == SPELL_CAST_OK)
             {
                 if (stacks < maxStacks)
-                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, stack %u/%u",
-                        me->GetName(), pVictim->GetName(), stacks + 1, maxStacks);
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, stack %u/%u (rage %u)",
+                        me->GetName(), pVictim->GetName(), stacks + 1, maxStacks, me->GetPower(POWER_RAGE) / 10);
                 else
-                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, refresh %u/%u (%.1f s left)",
-                        me->GetName(), pVictim->GetName(), stacks, maxStacks, remaining / 1000.0f);
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, refresh %u/%u (%.1f s left, rage %u)",
+                        me->GetName(), pVictim->GetName(), stacks, maxStacks, remaining / 1000.0f,
+                        me->GetPower(POWER_RAGE) / 10);
                 return;
             }
+        }
+
+        if (me->GetShapeshiftForm() == FORM_DEFENSIVESTANCE &&
+            IsWearingShield(me))
+        {
+            if (!me->GetAttackers().empty())
+            {
+                if (m_spells.warrior.pShieldBlock &&
+                    (m_role != ROLE_TANK || me->GetHealthPercent() < PB_SHIELD_BLOCK_HEALTH_PCT ||
+                     me->GetPower(POWER_RAGE) >= PB_SHIELD_BLOCK_SPARE_RAGE) &&
+                    CanTryToCastSpell(me, m_spells.warrior.pShieldBlock))
+                {
+                    if (DoCastSpell(me, m_spells.warrior.pShieldBlock) == SPELL_CAST_OK)
+                    {
+                        if (m_role == ROLE_TANK)
+                            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Shield Block (health %.0f%%, rage %u)",
+                                me->GetName(), me->GetHealthPercent(), me->GetPower(POWER_RAGE) / 10);
+                        return;
+                    }
+                }
+
+                if (m_spells.warrior.pShieldWall &&
+                   (me->GetHealthPercent() < 40.0f) &&
+                    CanTryToCastSpell(me, m_spells.warrior.pShieldWall))
+                {
+                    if (DoCastSpell(me, m_spells.warrior.pShieldWall) == SPELL_CAST_OK)
+                        return;
+                }
+            }
+
+            if (m_spells.warrior.pShieldSlam &&
+                CanTryToCastSpell(pVictim, m_spells.warrior.pShieldSlam))
+            {
+                if (DoCastSpell(pVictim, m_spells.warrior.pShieldSlam) == SPELL_CAST_OK)
+                    return;
+            }
+        }
+
+        if (m_spells.warrior.pThunderClap &&
+            m_role == ROLE_TANK &&
+            CanTryToCastSpell(pVictim, m_spells.warrior.pThunderClap))
+        {
+            if (DoCastSpell(pVictim, m_spells.warrior.pThunderClap) == SPELL_CAST_OK)
+                return;
         }
 
         if (m_spells.warrior.pHamstring &&
