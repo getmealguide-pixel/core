@@ -222,6 +222,11 @@ void CombatBotBaseAI::PopulateSpellData()
         if (pSpellEntry->HasAttribute(SPELL_ATTR_DO_NOT_DISPLAY))
             continue;
 
+        // Trainer "teach" entries share the real spell's name, have no rank and a higher id, so
+        // the rank pick below would choose them; casting one only re-learns the spell.
+        if (pSpellEntry->HasEffect(SPELL_EFFECT_LEARN_SPELL))
+            continue;
+
         auto IsHigherRankSpell = [pSpellEntry](SpellEntry const* pOldSpell)
         {
             if (!pOldSpell)

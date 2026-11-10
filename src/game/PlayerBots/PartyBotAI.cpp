@@ -3443,11 +3443,12 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
                 DoCastSpell(pVictim, m_spells.warrior.pSunderArmor) == SPELL_CAST_OK)
             {
                 if (stacks < maxStacks)
-                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, stack %u/%u (rage %u)",
-                        me->GetName(), pVictim->GetName(), stacks + 1, maxStacks, me->GetPower(POWER_RAGE) / 10);
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor (%u) on %s, stack %u/%u (rage %u)",
+                        me->GetName(), m_spells.warrior.pSunderArmor->Id, pVictim->GetName(), stacks + 1, maxStacks,
+                        me->GetPower(POWER_RAGE) / 10);
                 else
-                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor on %s, refresh %u/%u (%.1f s left, rage %u)",
-                        me->GetName(), pVictim->GetName(), stacks, maxStacks, remaining / 1000.0f,
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor (%u) on %s, refresh %u/%u (%.1f s left, rage %u)",
+                        me->GetName(), m_spells.warrior.pSunderArmor->Id, pVictim->GetName(), stacks, maxStacks, remaining / 1000.0f,
                         me->GetPower(POWER_RAGE) / 10);
                 return;
             }
