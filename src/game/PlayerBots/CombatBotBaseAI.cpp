@@ -2394,6 +2394,8 @@ void CombatBotBaseAI::SummonPetIfNeeded()
         {
             pCreature->SetLevel(me->GetLevel());
             me->CastSpell(pCreature, SPELL_TAME_BEAST, true);
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pet] %s: tames %s (level %u), pet %s",
+                me->GetName(), pCreature->GetName(), pCreature->GetLevel(), me->GetPet() ? "created" : "NOT created");
         }
     }
     else if (me->GetClass() == CLASS_WARLOCK)

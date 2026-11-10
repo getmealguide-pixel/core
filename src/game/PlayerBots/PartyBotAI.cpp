@@ -1479,6 +1479,8 @@ void PartyBotAI::SyncLevelWithLeader(Player const* pLeader)
     ResetSpellData();
     PopulateSpellData();
     AddAllSpellReagents();
+    if (me->GetClass() == CLASS_HUNTER)
+        MaintainHunterPet();
 
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Ding] %s: %u -> %u, spell book %+d, %u talent points unspent",
         me->GetName(), oldLevel, newLevel, int32(me->GetSpellMap().size()) - int32(oldSpellCount),
@@ -2459,8 +2461,48 @@ void PartyBotAI::UpdateInCombatAI_Shaman()
         HealInjuredTarget(me);
 }
 
+// Hunter pet upkeep: passive (attacks only on the hunter's order, so it waits out a pull timer
+// like the hunter), level = hunter level, always happy (bots carry no pet food).
+void PartyBotAI::MaintainHunterPet()
+{
+    Pet* pPet = me->GetPet();
+    if (!pPet || !pPet->IsAlive() || pPet->GetPetType() != HUNTER_PET)
+        return;
+
+    if (!pPet->HasReactState(REACT_PASSIVE))
+    {
+        pPet->SetReactState(REACT_PASSIVE);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pet] %s: pet %s (level %u) set passive",
+            me->GetName(), pPet->GetName(), pPet->GetLevel());
+    }
+
+    if (pPet->GetLevel() != me->GetLevel())
+    {
+        uint32 const oldLevel = pPet->GetLevel();
+        pPet->GivePetLevel(me->GetLevel());
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pet] %s: pet %s level %u -> %u (hunter %u)",
+            me->GetName(), pPet->GetName(), oldLevel, pPet->GetLevel(), me->GetLevel());
+    }
+
+    if (pPet->GetPower(POWER_HAPPINESS) < pPet->GetMaxPower(POWER_HAPPINESS))
+        pPet->SetPower(POWER_HAPPINESS, pPet->GetMaxPower(POWER_HAPPINESS));
+}
+
+// The pet attacks what the hunter attacks (passive pets only act on orders).
+void PartyBotAI::CommandPetAttack(Unit* pVictim)
+{
+    Pet* pPet = me->GetPet();
+    if (!pPet || !pPet->IsAlive() || pPet->GetVictim() == pVictim || !pPet->GetCharmInfo())
+        return;
+
+    pPet->GetCharmInfo()->SetIsCommandAttack(true);
+    pPet->AI()->AttackStart(pVictim);
+}
+
 void PartyBotAI::UpdateOutOfCombatAI_Hunter()
 {
+    MaintainHunterPet();
+
     if (m_spells.hunter.pAspectOfTheHawk &&
         CanTryToCastSpell(me, m_spells.hunter.pAspectOfTheHawk))
     {
@@ -2477,14 +2519,7 @@ void PartyBotAI::UpdateOutOfCombatAI_Hunter()
                 return;
         }
 
-        if (Pet* pPet = me->GetPet())
-        {
-            if (!pPet->GetVictim())
-            {
-                pPet->GetCharmInfo()->SetIsCommandAttack(true);
-                pPet->AI()->AttackStart(pVictim);
-            }
-        }
+        CommandPetAttack(pVictim);
 
         UpdateInCombatAI_Hunter();
     }
@@ -2494,8 +2529,12 @@ void PartyBotAI::UpdateOutOfCombatAI_Hunter()
 
 void PartyBotAI::UpdateInCombatAI_Hunter()
 {
+    MaintainHunterPet();
+
     if (Unit* pVictim = me->GetVictim())
     {
+        CommandPetAttack(pVictim);
+
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && me->GetDistance(pVictim) > 30.0f)
         {

@@ -151,6 +151,9 @@ public:
     // usability checks and interrupts a non-area cast; otherwise the normal casting rules apply.
     bool CastAreaOfEffectSpell(Unit* pTarget, bool forced);
 
+    void MaintainHunterPet();
+    void CommandPetAttack(Unit* pVictim);
+
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
     void UpdateOutOfCombatAI() final;
