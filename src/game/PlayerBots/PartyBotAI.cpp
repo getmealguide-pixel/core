@@ -2955,7 +2955,9 @@ void PartyBotAI::UpdateOutOfCombatAI_Priest()
 
 void PartyBotAI::UpdateInCombatAI_Priest()
 {
+    // Shield self only when hit or hurt, not at every pull.
     if (m_spells.priest.pPowerWordShield &&
+       (!me->GetAttackers().empty() || me->GetHealthPercent() < 50.0f) &&
         CanTryToCastSpell(me, m_spells.priest.pPowerWordShield))
     {
         if (DoCastSpell(me, m_spells.priest.pPowerWordShield) == SPELL_CAST_OK)
