@@ -90,7 +90,9 @@ public:
     PartyBotLayer SelectLayer() const;
     void SetActiveLayer(PartyBotLayer layer);
     void WakeUp();
+    char const* GetLayerName(PartyBotLayer layer) const;
     void OrderStay();
+    void OrderComeStay(Player const* pLeader);
     void OrderFollow();
     void OrderStackedFollow(bool stacked);
     bool IsStackedFollowing() const { return m_followMode == PB_FOLLOW_STACKED; }
@@ -100,7 +102,8 @@ public:
     void SetHoldPosition(bool hold);
     void SetHoldSpotHere();
     bool ReturnToHoldSpot();
-    bool CanMoveOnOwn() const final { return !m_holdPosition; }
+    // Stay and toggle both forbid moving on its own (no chasing, running away, movement spells).
+    bool CanMoveOnOwn() const final { return !m_holdPosition && m_followMode != PB_FOLLOW_STACKED; }
 
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
@@ -143,12 +146,14 @@ public:
     PartyBotFollowMode m_followMode = PB_FOLLOW_LOOSE;
     bool m_arrivedAtLeader = false;
     bool m_returningToHoldSpot = false;
-    uint32 m_returnStartTime = 0;
+    uint32 m_returnProgressTime = 0;
+    float m_returnBestDistance = 0.0f;
     uint32 m_holdMapId = 0;
     float m_holdX = 0.0f;
     float m_holdY = 0.0f;
     float m_holdZ = 0.0f;
     PartyBotLayer m_activeLayer = PB_LAYER_NONE;
+    char const* m_activeLayerName = "None";
 };
 
 #endif

@@ -46,7 +46,7 @@ enum PartyBotSpells
 #define PB_MAX_FOLLOW_ANGLE 6.0f
 #define PB_STACK_DIST 1.5f
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
-#define PB_HOLD_RETURN_TIMEOUT (10 * IN_MILLISECONDS)
+#define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -276,9 +276,14 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
     if (!CombatBotBaseAI::CanTryToCastSpell(pTarget, pSpellEntry))
         return false;
 
-    // Holding position: no spells that move the caster (Charge, Intercept, Feral Charge, Blink).
+    // Holding position or stacked: no spells that move the caster (Charge, Intercept, Feral Charge, Blink).
     if (!CanMoveOnOwn() &&
        (pSpellEntry->HasEffect(SPELL_EFFECT_CHARGE) || pSpellEntry->HasEffect(SPELL_EFFECT_LEAP)))
+        return false;
+
+    // Stacked and moving with the leader: only instant spells (a cast would be interrupted by moving).
+    if (m_followMode == PB_FOLLOW_STACKED && !m_holdPosition && me->IsMoving() &&
+       (pSpellEntry->IsChanneledSpell() || pSpellEntry->GetCastTime(me) > 0))
         return false;
 
     if (pSpellEntry->IsAreaOfEffectSpell() && !pSpellEntry->IsPositiveSpell() && !IsInDuel())
@@ -801,15 +806,18 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         me->ClearTarget();
 
     SetActiveLayer(SelectLayer());
-    bool const mayFollow = m_activeLayer != PB_LAYER_COMMAND;
+    bool const mayFollow = !m_holdPosition;
+    // "toggle": stay stacked on the leader at all times, also in combat.
+    bool const stackedFollow = mayFollow && m_followMode == PB_FOLLOW_STACKED;
 
     // Holding position: getting back to the spot comes before role duty.
-    if (m_activeLayer == PB_LAYER_COMMAND && ReturnToHoldSpot())
+    if (m_holdPosition && ReturnToHoldSpot())
         return;
 
     if (!me->IsInCombat())
     {
-        if (DrinkAndEat())
+        // Stacked bots do not sit down to eat while the leader is walking away.
+        if (!(stackedFollow && pLeader->IsMoving()) && DrinkAndEat())
         {
             if (!me->IsWithinDistInMap(pLeader, 100.0f))
             {
@@ -905,12 +913,14 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (!me->IsMoving())
     {
-        if (!pVictim)
+        if (!pVictim || stackedFollow)
         {
             if (mayFollow && me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
                 StartFollowing(pLeader);
         }
-        else
+
+        // Stacked bots keep the follow: AttackStart only starts auto-attack, chasing is blocked.
+        if (pVictim)
         {
             if (!me->HasUnitState(UNIT_STATE_MELEE_ATTACKING) &&
                (GetRole() == ROLE_MELEE_DPS || m_role == ROLE_TANK) &&
@@ -935,7 +945,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
 PartyBotLayer PartyBotAI::SelectLayer() const
 {
-    if (m_holdPosition)
+    if (m_holdPosition || m_followMode == PB_FOLLOW_STACKED)
         return PB_LAYER_COMMAND;
 
     if (me->IsInCombat() || me->GetVictim())
@@ -944,12 +954,12 @@ PartyBotLayer PartyBotAI::SelectLayer() const
     return PB_LAYER_FOLLOW;
 }
 
-static char const* GetPartyBotLayerName(PartyBotLayer layer)
+char const* PartyBotAI::GetLayerName(PartyBotLayer layer) const
 {
     switch (layer)
     {
         case PB_LAYER_COMMAND:
-            return "Command(stay)";
+            return m_holdPosition ? "Command(stay)" : "Command(toggle)";
         case PB_LAYER_ROLE_DUTY:
             return "RoleDuty";
         case PB_LAYER_FOLLOW:
@@ -961,18 +971,31 @@ static char const* GetPartyBotLayerName(PartyBotLayer layer)
 
 void PartyBotAI::SetActiveLayer(PartyBotLayer layer)
 {
-    if (layer == m_activeLayer)
+    char const* const name = GetLayerName(layer);
+    if (name == m_activeLayerName)
         return;
 
-    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %s -> %s", me->GetName(),
-        GetPartyBotLayerName(m_activeLayer), GetPartyBotLayerName(layer));
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %s -> %s", me->GetName(), m_activeLayerName, name);
     m_activeLayer = layer;
+    m_activeLayerName = name;
 }
 
 void PartyBotAI::OrderStay()
 {
     SetFollowMode(PB_FOLLOW_LOOSE);
     SetHoldPosition(true);
+}
+
+void PartyBotAI::OrderComeStay(Player const* pLeader)
+{
+    SetFollowMode(PB_FOLLOW_LOOSE);
+    SetHoldPosition(true);
+
+    // Hold the leader's current spot; ReturnToHoldSpot walks there.
+    m_holdMapId = pLeader->GetMapId();
+    m_holdX = pLeader->GetPositionX();
+    m_holdY = pLeader->GetPositionY();
+    m_holdZ = pLeader->GetPositionZ();
 }
 
 void PartyBotAI::OrderFollow()
@@ -1012,7 +1035,9 @@ void PartyBotAI::SetFollowMode(PartyBotFollowMode mode)
     m_followMode = mode;
 
     // Drop the current follow so the next update restarts it with the new distance.
-    if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+    // Entering "toggle" also drops any chase, so the bot goes straight to the leader.
+    MovementGeneratorType const currentMove = me->GetMotionMaster()->GetCurrentMovementGeneratorType();
+    if (currentMove == FOLLOW_MOTION_TYPE || (mode == PB_FOLLOW_STACKED && currentMove != IDLE_MOTION_TYPE))
     {
         me->StopMoving();
         me->GetMotionMaster()->Clear(false, true);
@@ -1096,11 +1121,17 @@ bool PartyBotAI::ReturnToHoldSpot()
 
     if (!m_returningToHoldSpot)
     {
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: displaced %.1f yd, returning", me->GetName(), distance);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %.1f yd from spot, moving there", me->GetName(), distance);
         m_returningToHoldSpot = true;
-        m_returnStartTime = WorldTimer::getMSTime();
+        m_returnBestDistance = distance;
+        m_returnProgressTime = WorldTimer::getMSTime();
     }
-    else if (WorldTimer::getMSTimeDiffToNow(m_returnStartTime) > PB_HOLD_RETURN_TIMEOUT)
+    else if (distance < m_returnBestDistance - 1.0f)
+    {
+        m_returnBestDistance = distance;
+        m_returnProgressTime = WorldTimer::getMSTime();
+    }
+    else if (WorldTimer::getMSTimeDiffToNow(m_returnProgressTime) > PB_HOLD_NO_PROGRESS_TIMEOUT)
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: cannot reach spot (%.1f yd away), holding here", me->GetName(), distance);
         m_returningToHoldSpot = false;

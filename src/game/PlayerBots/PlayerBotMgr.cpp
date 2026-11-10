@@ -1698,9 +1698,10 @@ enum PartyBotMoveOrder : uint8
     PB_ORDER_STAY,
     PB_ORDER_FOLLOW,
     PB_ORDER_TOGGLE,
+    PB_ORDER_COMESTAY,
 };
 
-static bool HandlePartyBotMoveOrderApplyHelper(Player* pTarget, uint8 order, bool stacked)
+static bool HandlePartyBotMoveOrderApplyHelper(Player* pTarget, Player const* pLeader, uint8 order, bool stacked)
 {
     PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget);
     if (!pAI)
@@ -1716,6 +1717,9 @@ static bool HandlePartyBotMoveOrderApplyHelper(Player* pTarget, uint8 order, boo
             break;
         case PB_ORDER_TOGGLE:
             pAI->OrderStackedFollow(stacked);
+            break;
+        case PB_ORDER_COMESTAY:
+            pAI->OrderComeStay(pLeader);
             break;
     }
 
@@ -1779,7 +1783,7 @@ bool ChatHandler::HandlePartyBotMoveOrderHelper(char* args, uint8 order)
                 stacked = true;
 
     for (Player* pBot : bots)
-        HandlePartyBotMoveOrderApplyHelper(pBot, order, stacked);
+        HandlePartyBotMoveOrderApplyHelper(pBot, pPlayer, order, stacked);
 
     char const* result;
     switch (order)
@@ -1789,6 +1793,9 @@ bool ChatHandler::HandlePartyBotMoveOrderHelper(char* args, uint8 order)
             break;
         case PB_ORDER_FOLLOW:
             result = "coming to you, then following";
+            break;
+        case PB_ORDER_COMESTAY:
+            result = "coming to your position and staying there";
             break;
         default:
             result = stacked ? "following stacked (toggle on)" : "following loosely (toggle off)";
@@ -1816,6 +1823,11 @@ bool ChatHandler::HandlePartyBotFollowCommand(char* args)
 bool ChatHandler::HandlePartyBotToggleCommand(char* args)
 {
     return HandlePartyBotMoveOrderHelper(args, PB_ORDER_TOGGLE);
+}
+
+bool ChatHandler::HandlePartyBotComeStayCommand(char* args)
+{
+    return HandlePartyBotMoveOrderHelper(args, PB_ORDER_COMESTAY);
 }
 
 bool ChatHandler::HandlePartyBotPullCommand(char* args)
