@@ -82,6 +82,8 @@ public:
     PartyBotLayer SelectLayer() const;
     void SetActiveLayer(PartyBotLayer layer);
     void SetHoldPosition(bool hold);
+    void SetHoldSpotHere();
+    bool ReturnToHoldSpot();
     bool CanMoveOnOwn() const final { return !m_holdPosition; }
 
     bool CheckForDispelTargets();
@@ -122,6 +124,12 @@ public:
     float m_o = 0.0f;
     bool m_resetSpellData = false;
     bool m_holdPosition = false;
+    bool m_returningToHoldSpot = false;
+    uint32 m_returnStartTime = 0;
+    uint32 m_holdMapId = 0;
+    float m_holdX = 0.0f;
+    float m_holdY = 0.0f;
+    float m_holdZ = 0.0f;
     PartyBotLayer m_activeLayer = PB_LAYER_NONE;
 };
 

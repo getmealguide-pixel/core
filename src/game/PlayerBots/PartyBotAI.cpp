@@ -44,6 +44,8 @@ enum PartyBotSpells
 #define PB_MAX_FOLLOW_DIST 6.0f
 #define PB_MIN_FOLLOW_ANGLE 0.0f
 #define PB_MAX_FOLLOW_ANGLE 6.0f
+#define PB_HOLD_SPOT_TOLERANCE 2.0f
+#define PB_HOLD_RETURN_TIMEOUT (10 * IN_MILLISECONDS)
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -800,6 +802,10 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     SetActiveLayer(SelectLayer());
     bool const mayFollow = m_activeLayer != PB_LAYER_COMMAND;
 
+    // Holding position: getting back to the spot comes before role duty.
+    if (m_activeLayer == PB_LAYER_COMMAND && ReturnToHoldSpot())
+        return;
+
     if (!me->IsInCombat())
     {
         if (DrinkAndEat())
@@ -962,13 +968,70 @@ void PartyBotAI::SetActiveLayer(PartyBotLayer layer)
 void PartyBotAI::SetHoldPosition(bool hold)
 {
     m_holdPosition = hold;
+    m_returningToHoldSpot = false;
 
     if (hold)
     {
         me->StopMoving();
         me->GetMotionMaster()->Clear(false, true);
         me->GetMotionMaster()->MoveIdle();
+        SetHoldSpotHere();
     }
+}
+
+void PartyBotAI::SetHoldSpotHere()
+{
+    m_holdMapId = me->GetMapId();
+    m_holdX = me->GetPositionX();
+    m_holdY = me->GetPositionY();
+    m_holdZ = me->GetPositionZ();
+}
+
+// Returns true while the bot is walking back to its held spot.
+bool PartyBotAI::ReturnToHoldSpot()
+{
+    if (me->GetMapId() != m_holdMapId)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: left the map of its spot, holding here", me->GetName());
+        m_returningToHoldSpot = false;
+        SetHoldSpotHere();
+        return false;
+    }
+
+    float const distance = me->GetDistance(m_holdX, m_holdY, m_holdZ, SizeFactor::None);
+    if (distance <= PB_HOLD_SPOT_TOLERANCE)
+    {
+        if (m_returningToHoldSpot)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: back on spot", me->GetName());
+            m_returningToHoldSpot = false;
+        }
+        return false;
+    }
+
+    if (!m_returningToHoldSpot)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: displaced %.1f yd, returning", me->GetName(), distance);
+        m_returningToHoldSpot = true;
+        m_returnStartTime = WorldTimer::getMSTime();
+    }
+    else if (WorldTimer::getMSTimeDiffToNow(m_returnStartTime) > PB_HOLD_RETURN_TIMEOUT)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: cannot reach spot (%.1f yd away), holding here", me->GetName(), distance);
+        m_returningToHoldSpot = false;
+        me->StopMoving();
+        me->GetMotionMaster()->Clear(false, true);
+        me->GetMotionMaster()->MoveIdle();
+        SetHoldSpotHere();
+        return false;
+    }
+
+    if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+    {
+        me->GetMotionMaster()->MovePoint(0, m_holdX, m_holdY, m_holdZ, MOVE_PATHFINDING);
+    }
+
+    return true;
 }
 
 void PartyBotAI::UpdateOutOfCombatAI()
