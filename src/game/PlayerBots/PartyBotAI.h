@@ -81,6 +81,7 @@ public:
 
     PartyBotLayer SelectLayer() const;
     void SetActiveLayer(PartyBotLayer layer);
+    void WakeUp();
     void SetHoldPosition(bool hold);
     void SetHoldSpotHere();
     bool ReturnToHoldSpot();

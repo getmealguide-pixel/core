@@ -979,6 +979,13 @@ void PartyBotAI::SetHoldPosition(bool hold)
     }
 }
 
+// Run the AI on the next world tick. An active pause (timer longer than one interval) is kept.
+void PartyBotAI::WakeUp()
+{
+    if (m_updateTimer.GetExpiry() <= PB_UPDATE_INTERVAL)
+        m_updateTimer.Reset(0);
+}
+
 void PartyBotAI::SetHoldSpotHere()
 {
     m_holdMapId = me->GetMapId();

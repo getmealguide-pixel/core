@@ -857,6 +857,16 @@ bool ChatHandler::PartyBotAddRequirementCheck(Player const* pPlayer, Player cons
     return true;
 }
 
+// All .partybot commands look up bots through here, so a commanded bot reacts on the next
+// world tick instead of waiting for its next AI update (up to PB_UPDATE_INTERVAL).
+static PartyBotAI* GetCommandedPartyBotAI(Player* pBot)
+{
+    PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pBot->AI());
+    if (pAI)
+        pAI->WakeUp();
+    return pAI;
+}
+
 bool ChatHandler::HandlePartyBotAddCommand(char* args)
 {
     Player* pPlayer = m_session->GetPlayer();
@@ -1077,7 +1087,7 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
 
     if (pTarget->AI())
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             pAI->m_role = role;
             pAI->ResetSpellData();
@@ -1120,7 +1130,7 @@ bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     if (pMember->IsValidAttackTarget(pTarget))
                         pAI->AttackStart(pTarget);
@@ -1173,7 +1183,7 @@ bool ChatHandler::HandlePartyBotAttackStopCommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     if (pMember->GetVictim() == pTarget)
                         StopPartyBotAttackHelper(pAI, pMember);
@@ -1214,7 +1224,7 @@ bool ChatHandler::HandlePartyBotAoECommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     for (auto const& pSpell : pAI->m_spells.raw.spells)
                     {
@@ -1258,7 +1268,7 @@ bool ChatHandler::HandlePartyBotToggleCastingCommand(bool allowCasting)
     {
         if (pTarget->AI())
         {
-            if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+            if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 if (allowCasting)
                 {
@@ -1296,7 +1306,7 @@ bool ChatHandler::HandlePartyBotToggleCastingCommand(bool allowCasting)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     if (allowCasting)
                     {
@@ -1350,7 +1360,7 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
     {
         if (pTarget->AI())
         {
-            if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+            if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 PSendSysMessage("%s will crowd control %s.", pTarget->GetName(), args);
                 pAI->m_marksToCC.push_back(itrMark->second);
@@ -1379,7 +1389,7 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     pAI->m_marksToCC.push_back(itrMark->second);
                 }
@@ -1409,7 +1419,7 @@ bool ChatHandler::HandlePartyBotFocusMarkCommand(char* args)
     {
         if (pTarget->AI())
         {
-            if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+            if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 if (std::find(pAI->m_marksToFocus.begin(), pAI->m_marksToFocus.end(), itrMark->second) != pAI->m_marksToFocus.end())
                 {
@@ -1444,7 +1454,7 @@ bool ChatHandler::HandlePartyBotFocusMarkCommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     if (std::find(pAI->m_marksToFocus.begin(), pAI->m_marksToFocus.end(), itrMark->second) != pAI->m_marksToFocus.end())
                     {
@@ -1470,7 +1480,7 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
     {
         if (pTarget->AI())
         {
-            if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+            if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 PSendSysMessage("All mark assignments cleared for %s.", pTarget->GetName());
                 pAI->m_marksToCC.clear();
@@ -1500,7 +1510,7 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     pAI->m_marksToCC.clear();
                     pAI->m_marksToFocus.clear();
@@ -1517,7 +1527,7 @@ bool HandlePartyBotComeToMeHelper(Player* pBot, Player* pPlayer)
 {
     if (pBot->AI() && pBot->IsAlive() && pBot->IsInMap(pPlayer) && !pBot->HasUnitState(UNIT_STATE_NO_FREE_MOVE))
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pBot->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pBot))
         {
             pAI->SetHoldPosition(false);
 
@@ -1581,7 +1591,7 @@ bool HandlePartyBotUseGObjectHelper(Player* pTarget, GameObject* pGo)
 {
     if (pTarget->AI())
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             if (pTarget->IsWithinDist(pGo, INTERACTION_DISTANCE))
             {
@@ -1640,7 +1650,7 @@ bool HandlePartyBotPauseApplyHelper(Player* pTarget, uint32 duration)
 {
     if (pTarget->AI())
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             pAI->m_updateTimer.Reset(duration);
 
@@ -1751,7 +1761,7 @@ bool HandlePartyBotHoldApplyHelper(Player* pTarget, bool hold)
 {
     if (pTarget->AI())
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             pAI->SetHoldPosition(hold);
             return true;
@@ -1859,7 +1869,7 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
 
             if (pMember->AI())
             {
-                if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     if (pAI->m_role == ROLE_MELEE_DPS || pAI->m_role == ROLE_RANGE_DPS)
                     {
@@ -1908,7 +1918,7 @@ bool ChatHandler::HandlePartyBotUnequipCommand(char* args)
 
     if (pTarget->AI())
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             pTarget->DestroyItemCount(itemId, count, true);
             return true;
@@ -1932,7 +1942,7 @@ bool ChatHandler::HandlePartyBotRemoveCommand(char* args)
 
     if (pTarget->AI())
     {
-        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
             pAI->botEntry->requestRemoval = true;
             return true;
