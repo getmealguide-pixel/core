@@ -252,6 +252,54 @@ public:
         }
         return false;
     }
+    // Role a new bot gets when none is asked for (same defaults as AutoAssignRole without talents).
+    static CombatBotRoles GetDefaultRoleForClass(uint8 playerClass)
+    {
+        switch (playerClass)
+        {
+            case CLASS_WARRIOR:
+            case CLASS_ROGUE:
+                return ROLE_MELEE_DPS;
+            case CLASS_HUNTER:
+            case CLASS_MAGE:
+            case CLASS_WARLOCK:
+                return ROLE_RANGE_DPS;
+            default: // paladin, priest, shaman, druid
+                return ROLE_HEALER;
+        }
+    }
+    static char const* GetRoleName(CombatBotRoles role)
+    {
+        switch (role)
+        {
+            case ROLE_TANK:
+                return "tank";
+            case ROLE_HEALER:
+                return "healer";
+            case ROLE_MELEE_DPS:
+                return "melee dps";
+            case ROLE_RANGE_DPS:
+                return "ranged dps";
+            default:
+                return "no role";
+        }
+    }
+    static bool CanClassDoRole(uint8 playerClass, CombatBotRoles role)
+    {
+        switch (role)
+        {
+            case ROLE_TANK:
+                return IsTankClass(playerClass);
+            case ROLE_HEALER:
+                return IsHealerClass(playerClass);
+            case ROLE_MELEE_DPS:
+                return IsMeleeDamageClass(playerClass);
+            case ROLE_RANGE_DPS:
+                return IsRangedDamageClass(playerClass);
+            default:
+                return false;
+        }
+    }
     static bool IsStealthClass(uint8 playerClass)
     {
         switch (playerClass)

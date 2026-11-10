@@ -43,7 +43,8 @@ class PlayerBotAI: public PlayerAI
         virtual void OnPlayerLogin() {}
         virtual void BeforeAddToMap(Player* player) {} // me=nullptr at call
         // Helpers
-        bool SpawnNewPlayer(WorldSession* sess, uint8 classId, uint32 raceId, uint32 mapId, uint32 instanceId, float dx, float dy, float dz, float o, Player* pClone = nullptr);
+        // gender: GENDER_MALE / GENDER_FEMALE, anything else = random (ignored when cloning).
+        bool SpawnNewPlayer(WorldSession* sess, uint8 classId, uint32 raceId, uint32 mapId, uint32 instanceId, float dx, float dy, float dz, float o, Player* pClone = nullptr, uint8 gender = GENDER_NONE);
         PlayerBotEntry* botEntry;
 };
 

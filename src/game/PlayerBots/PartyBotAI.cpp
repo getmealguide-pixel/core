@@ -48,6 +48,7 @@ enum PartyBotSpells
 #define PB_STACK_DIST 1.5f
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
+#define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 {
@@ -57,7 +58,7 @@ bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
         return true;
     }
 
-    return SpawnNewPlayer(sess, m_class, m_race, m_mapId, m_instanceId, m_x, m_y, m_z, m_o, sObjectAccessor.FindPlayer(m_cloneGuid));
+    return SpawnNewPlayer(sess, m_class, m_race, m_mapId, m_instanceId, m_x, m_y, m_z, m_o, sObjectAccessor.FindPlayer(m_cloneGuid), m_gender);
 }
 
 void PartyBotAI::CloneFromPlayer(Player const* pPlayer)
@@ -197,14 +198,22 @@ bool PartyBotAI::DrinkAndEat()
     if (me->GetVictim())
         return false;
 
-    bool const needToEat = me->GetHealthPercent() < 100.0f;
-    bool const needToDrink = (me->GetPowerType() == POWER_MANA) && (me->GetPowerPercent(POWER_MANA) < 100.0f);
+    // Like a player: sit down only when clearly low; once sitting, eat/drink up to full.
+    bool const isEating = me->HasAura(PB_SPELL_FOOD);
+    bool const isDrinking = me->HasAura(PB_SPELL_DRINK);
+    bool const isSitting = isEating || isDrinking;
+    float const healthPct = me->GetHealthPercent();
+    float const manaPct = me->GetPowerType() == POWER_MANA ? me->GetPowerPercent(POWER_MANA) : 100.0f;
+
+    bool const needToEat = healthPct < 100.0f && (isSitting || healthPct < PB_EAT_DRINK_START_PCT);
+    bool const needToDrink = manaPct < 100.0f && (isSitting || manaPct < PB_EAT_DRINK_START_PCT);
 
     if (!needToEat && !needToDrink)
         return false;
 
-    bool const isEating = me->HasAura(PB_SPELL_FOOD);
-    bool const isDrinking = me->HasAura(PB_SPELL_DRINK);
+    if (!isSitting)
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: sits down to %s (health %.0f%%, mana %.0f%%)",
+            me->GetName(), needToDrink ? (needToEat ? "eat and drink" : "drink") : "eat", healthPct, manaPct);
 
     if (!isEating && needToEat)
     {
@@ -625,6 +634,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         if (m_followMode == PB_FOLLOW_STACKED && !m_holdPosition)
             ReactToLeaderMovement();
 
+        if (!m_holdPosition)
+            StandUpToFollow();
+
         FaceCombatTarget();
     }
 
@@ -833,9 +845,12 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (!me->IsInCombat())
     {
-        // Stacked bots only eat/drink once they are on the leader and the leader stands still.
-        if (!(stackedFollow && (pLeader->IsMoving() || !me->IsWithinDist(pLeader, PB_STACK_DIST, true, SizeFactor::None))) &&
-            DrinkAndEat())
+        // On stay: eat/drink freely. Otherwise following wins: only once near the leader
+        // (stacked: on the leader) and while the leader stands still.
+        bool const mayEatDrink = !mayFollow ||
+            (!pLeader->IsMoving() &&
+              me->IsWithinDist(pLeader, stackedFollow ? PB_STACK_DIST : PB_MAX_FOLLOW_DIST + 2.0f, true, SizeFactor::None));
+        if (mayEatDrink && DrinkAndEat())
         {
             if (!me->IsWithinDistInMap(pLeader, 100.0f))
             {
@@ -1148,6 +1163,32 @@ void PartyBotAI::ReactToLeaderMovement()
     if (me->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
         me->InterruptSpell(CURRENT_CHANNELED_SPELL);
 
+    WakeUp();
+}
+
+// Checked every world tick unless on stay: following the leader beats eating/drinking, so a
+// sitting bot stands up the moment the leader moves (and follows on the next tick).
+void PartyBotAI::StandUpToFollow()
+{
+    bool const isEating = me->HasAura(PB_SPELL_FOOD);
+    bool const isDrinking = me->HasAura(PB_SPELL_DRINK);
+    if (!isEating && !isDrinking)
+        return;
+
+    // Not while paused (an active pause keeps the update timer longer than one interval).
+    if (m_updateTimer.GetExpiry() > PB_UPDATE_INTERVAL)
+        return;
+
+    Player* pLeader = GetPartyLeader();
+    if (!pLeader || !pLeader->IsInWorld() || !pLeader->IsMoving())
+        return;
+
+    me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
+    me->RemoveAurasDueToSpell(PB_SPELL_DRINK);
+    if (me->GetStandState() != UNIT_STAND_STATE_STAND)
+        me->SetStandState(UNIT_STAND_STATE_STAND);
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: stops %s to follow", me->GetName(),
+        isDrinking ? (isEating ? "eating and drinking" : "drinking") : "eating");
     WakeUp();
 }
 

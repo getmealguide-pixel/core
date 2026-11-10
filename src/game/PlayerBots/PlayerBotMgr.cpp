@@ -881,85 +881,164 @@ bool ChatHandler::HandlePartyBotAddCommand(char* args)
         return false;
     }
 
-    if (!args)
+    // Optional words in any order: race, gender, class, role, level. Missing parts are picked
+    // at random among the combinations that are valid with the given ones.
+    static std::map<std::string, uint8> const classWords =
     {
-        SendSysMessage("Incorrect syntax. Expected role or class.");
+        { "warrior", CLASS_WARRIOR }, { "paladin", CLASS_PALADIN }, { "hunter", CLASS_HUNTER },
+        { "rogue", CLASS_ROGUE }, { "priest", CLASS_PRIEST }, { "shaman", CLASS_SHAMAN },
+        { "mage", CLASS_MAGE }, { "warlock", CLASS_WARLOCK }, { "druid", CLASS_DRUID },
+    };
+    static std::map<std::string, uint8> const raceWords =
+    {
+        { "human", RACE_HUMAN }, { "dwarf", RACE_DWARF }, { "nightelf", RACE_NIGHTELF },
+        { "gnome", RACE_GNOME }, { "orc", RACE_ORC }, { "undead", RACE_UNDEAD },
+        { "tauren", RACE_TAUREN }, { "troll", RACE_TROLL },
+    };
+    static std::map<std::string, CombatBotRoles> const roleWords =
+    {
+        { "tank", ROLE_TANK }, { "healer", ROLE_HEALER }, { "melee", ROLE_MELEE_DPS },
+        { "meleedps", ROLE_MELEE_DPS }, { "ranged", ROLE_RANGE_DPS }, { "rangedps", ROLE_RANGE_DPS },
+        { "dps", ROLE_INVALID }, // melee or ranged, depending on the class
+    };
+
+    auto refuse = [this](std::string const& message)
+    {
+        SendSysMessage(message.c_str());
         SetSentErrorMessage(true);
         return false;
-    }
+    };
+    auto nameOf = [](std::map<std::string, uint8> const& words, uint8 value)
+    {
+        for (auto const& itr : words)
+            if (itr.second == value)
+            {
+                std::string name = itr.first;
+                name[0] = toupper(name[0]);
+                return name;
+            }
+        return std::string("?");
+    };
 
     uint8 botClass = 0;
+    uint8 botRace = 0;
+    uint8 botGender = GENDER_NONE;
     uint32 botLevel = pPlayer->GetLevel();
+    bool levelGiven = false;
+    bool roleGiven = false;
+    std::string roleWord;
     CombatBotRoles botRole = ROLE_INVALID;
+    // Custom levels only for GM accounts or when checks are skipped.
+    bool const mayChooseLevel = GetSession()->GetSecurity() > SEC_PLAYER || sWorld.getConfig(CONFIG_BOOL_PARTY_BOT_SKIP_CHECKS);
 
-    if (char* arg1 = ExtractArg(&args))
+    while (char* arg = ExtractArg(&args))
     {
-        std::string option = arg1;
-        if (option == "warrior")
-            botClass = CLASS_WARRIOR;
-        else if (option == "paladin" && pPlayer->GetTeam() == ALLIANCE)
-            botClass = CLASS_PALADIN;
-        else if (option == "hunter")
-            botClass = CLASS_HUNTER;
-        else if (option == "rogue")
-            botClass = CLASS_ROGUE;
-        else if (option == "priest")
-            botClass = CLASS_PRIEST;
-        else if (option == "shaman" && pPlayer->GetTeam() == HORDE)
-            botClass = CLASS_SHAMAN;
-        else if (option == "mage")
-            botClass = CLASS_MAGE;
-        else if (option == "warlock")
-            botClass = CLASS_WARLOCK;
-        else if (option == "druid")
-            botClass = CLASS_DRUID;
-        else if (option == "dps")
-        {
-            botClass = PickRandomValue(CLASS_WARRIOR, CLASS_HUNTER, CLASS_ROGUE, CLASS_MAGE, CLASS_WARLOCK);
-            botRole = CombatBotBaseAI::IsMeleeDamageClass(botClass) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
-        }
-        else if (option == "healer")
-        {
-            std::vector<uint32> dpsClasses = { CLASS_PRIEST, CLASS_DRUID };
-            if (pPlayer->GetTeam() == HORDE)
-                dpsClasses.push_back(CLASS_SHAMAN);
-            else
-                dpsClasses.push_back(CLASS_PALADIN);
-            botClass = SelectRandomContainerElement(dpsClasses);
-            botRole = ROLE_HEALER;
-        }
-        else if (option == "tank")
-        {
-            botClass = CLASS_WARRIOR;
-            botRole = ROLE_TANK;
-        }
+        std::string word = arg;
+        std::transform(word.begin(), word.end(), word.begin(), ::tolower);
 
-        // Prevent setting a custom level for bots unless the account is a GM or skipping checks is enabled.
-        if (GetSession()->GetSecurity() > SEC_PLAYER || sWorld.getConfig(CONFIG_BOOL_PARTY_BOT_SKIP_CHECKS))
-            ExtractUInt32(&args, botLevel);
+        if (classWords.count(word))
+        {
+            if (botClass)
+                return refuse("Two classes given.");
+            botClass = classWords.at(word);
+        }
+        else if (raceWords.count(word))
+        {
+            if (botRace)
+                return refuse("Two races given.");
+            botRace = raceWords.at(word);
+        }
+        else if (word == "male" || word == "female")
+        {
+            if (botGender != GENDER_NONE)
+                return refuse("Two genders given.");
+            botGender = word == "male" ? GENDER_MALE : GENDER_FEMALE;
+        }
+        else if (roleWords.count(word))
+        {
+            if (roleGiven)
+                return refuse("Two roles given.");
+            roleGiven = true;
+            roleWord = word;
+            botRole = roleWords.at(word);
+        }
+        else if (!word.empty() && std::all_of(word.begin(), word.end(), ::isdigit))
+        {
+            if (!mayChooseLevel)
+                return refuse("You cannot choose the bot level.");
+            if (levelGiven)
+                return refuse("Two levels given.");
+            levelGiven = true;
+            botLevel = std::stoul(word);
+        }
+        else
+            return refuse("Unknown word '" + word + "'. Use race, male/female, class, role (tank, healer, dps, melee, ranged) or level.");
     }
 
-    if (!botClass)
+    if (!botClass && !botRace && !roleGiven && botGender == GENDER_NONE)
+        return refuse("Incorrect syntax. Expected race, male/female, class and/or role.");
+
+    Team const team = pPlayer->GetTeam();
+    uint32 const teamRaceMask = team == ALLIANCE ? RACEMASK_ALLIANCE : RACEMASK_HORDE;
+    char const* teamName = team == ALLIANCE ? "Alliance" : "Horde";
+
+    if (botRace && !((1 << (botRace - 1)) & teamRaceMask))
+        return refuse(nameOf(raceWords, botRace) + " is " + (team == ALLIANCE ? "Horde" : "Alliance") + "; you are " + teamName + ".");
+
+    // A class fits if it can do the role and some allowed race can play it.
+    auto roleFits = [&](uint8 playerClass)
     {
-        SendSysMessage("Incorrect syntax. Expected role or class.");
-        SetSentErrorMessage(true);
-        return false;
+        if (!roleGiven)
+            return true;
+        if (botRole == ROLE_INVALID) // "dps"
+            return CombatBotBaseAI::IsMeleeDamageClass(playerClass) || CombatBotBaseAI::IsRangedDamageClass(playerClass);
+        return CombatBotBaseAI::CanClassDoRole(playerClass, botRole);
+    };
+    auto raceFits = [&](uint8 playerClass)
+    {
+        if (botRace)
+            return sObjectMgr.GetPlayerInfo(botRace, playerClass) != nullptr;
+        return SelectRandomRaceForClass(playerClass, team) != 0;
+    };
+
+    if (botClass)
+    {
+        if (botRace && !raceFits(botClass))
+            return refuse(nameOf(raceWords, botRace) + " cannot be a " + nameOf(classWords, botClass) + ".");
+        if (!raceFits(botClass))
+            return refuse(std::string("No ") + teamName + " race can be a " + nameOf(classWords, botClass) + ".");
+        if (!roleFits(botClass))
+            return refuse(nameOf(classWords, botClass) + " cannot be a " + roleWord + ".");
+    }
+    else
+    {
+        std::vector<uint8> candidates;
+        for (auto const& itr : classWords)
+            if (raceFits(itr.second) && roleFits(itr.second))
+                candidates.push_back(itr.second);
+        if (candidates.empty())
+            return refuse(std::string("No valid ") + teamName + " class for that combination.");
+        botClass = SelectRandomContainerElement(candidates);
     }
 
-    uint8 botRace = SelectRandomRaceForClass(botClass, pPlayer->GetTeam());
+    if (roleGiven && botRole == ROLE_INVALID) // "dps"
+        botRole = CombatBotBaseAI::IsMeleeDamageClass(botClass) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
+    else if (!roleGiven) // decided now, so it is known and shown at once
+        botRole = CombatBotBaseAI::GetDefaultRoleForClass(botClass);
+
     if (!botRace)
-    {
-        SendSysMessage("Unable to select race for bot.");
-        SetSentErrorMessage(true);
-        return false;
-    }
+        botRace = SelectRandomRaceForClass(botClass, team);
 
     float x, y, z;
     pPlayer->GetNearPoint(pPlayer, x, y, z, 0, 5.0f, frand(0.0f, 6.0f));
 
     PartyBotAI* ai = new PartyBotAI(pPlayer, nullptr, botRole, botRace, botClass, botLevel, pPlayer->GetMapId(), pPlayer->GetMap()->GetInstanceId(), x, y, z, pPlayer->GetOrientation());
+    ai->m_gender = botGender;
     if (sPlayerBotMgr.AddBot(ai))
-        SendSysMessage("New party bot added.");
+        PSendSysMessage("New party bot added: %s%s %s, %s.",
+            botGender == GENDER_NONE ? "" : (botGender == GENDER_MALE ? "male " : "female "),
+            nameOf(raceWords, botRace).c_str(), nameOf(classWords, botClass).c_str(),
+            CombatBotBaseAI::GetRoleName(botRole));
     else
     {
         delete ai;
@@ -1087,27 +1166,7 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
     if (role == ROLE_INVALID)
         return false;
 
-    uint8 const botClass = pTarget->GetClass();
-    bool classCanDoRole = false;
-    switch (role)
-    {
-        case ROLE_TANK:
-            classCanDoRole = CombatBotBaseAI::IsTankClass(botClass);
-            break;
-        case ROLE_HEALER:
-            classCanDoRole = CombatBotBaseAI::IsHealerClass(botClass);
-            break;
-        case ROLE_MELEE_DPS:
-            classCanDoRole = CombatBotBaseAI::IsMeleeDamageClass(botClass);
-            break;
-        case ROLE_RANGE_DPS:
-            classCanDoRole = CombatBotBaseAI::IsRangedDamageClass(botClass);
-            break;
-        default:
-            break;
-    }
-
-    if (!classCanDoRole)
+    if (!CombatBotBaseAI::CanClassDoRole(pTarget->GetClass(), role))
     {
         PSendSysMessage("%s cannot be a %s (wrong class).", pTarget->GetName(), roleStr.c_str());
         SetSentErrorMessage(true);
@@ -1249,10 +1308,7 @@ bool ChatHandler::HandlePartyBotSlotsCommand(char* /*args*/)
     std::sort(ordered.begin(), ordered.end());
 
     if (ordered.empty())
-    {
         SendSysMessage("No tanks in the group.");
-        return true;
-    }
 
     for (auto const& itr : ordered)
     {
@@ -1277,6 +1333,16 @@ bool ChatHandler::HandlePartyBotSlotsCommand(char* /*args*/)
 
         PSendSysMessage("%s: %s (%s%s)", PartyBotAI::GetTankSlotName(itr.first).c_str(),
             pMember->GetName(), how, singleFocus ? ", single focus" : "");
+    }
+
+    // Everyone else: bots with their role.
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || slots.count(pMember->GetObjectGuid()))
+            continue;
+        if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+            PSendSysMessage("%s: %s", pMember->GetName(), CombatBotBaseAI::GetRoleName(pAI->GetRole()));
     }
     return true;
 }

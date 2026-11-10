@@ -72,7 +72,7 @@ enum
 };
 
 
-bool PlayerBotAI::SpawnNewPlayer(WorldSession* sess, uint8 class_, uint32 race_, uint32 mapId, uint32 instanceId, float x, float y, float z, float o, Player* pClone)
+bool PlayerBotAI::SpawnNewPlayer(WorldSession* sess, uint8 class_, uint32 race_, uint32 mapId, uint32 instanceId, float x, float y, float z, float o, Player* pClone, uint8 requestedGender)
 {
     ASSERT(botEntry);
     std::string name = sObjectMgr.GenerateFreePlayerName();
@@ -96,7 +96,7 @@ bool PlayerBotAI::SpawnNewPlayer(WorldSession* sess, uint8 class_, uint32 race_,
     }
     else
     {
-        gender = urand(0, 1);
+        gender = (requestedGender == GENDER_MALE || requestedGender == GENDER_FEMALE) ? requestedGender : urand(0, 1);
         Player::SelectRandomAppearance(race_, gender, hairStyle, hairColor, face, facialHair, skin);
     }
 

@@ -111,6 +111,7 @@ public:
     void UpdateFollowMode(Player const* pLeader);
     void StartFollowing(Player* pLeader);
     void ReactToLeaderMovement();
+    void StandUpToFollow();
     void BreakActionsAndFollowNow();
     void FaceCombatTarget();
     void SetHoldPosition(bool hold);
@@ -172,6 +173,7 @@ public:
     uint8 m_race = 0;
     uint8 m_class = 0;
     uint8 m_level = 0;
+    uint8 m_gender = GENDER_NONE; // requested gender of a new bot (GENDER_NONE = random)
     uint32 m_mapId = 0;
     uint32 m_instanceId = 0;
     float m_x = 0.0f;
