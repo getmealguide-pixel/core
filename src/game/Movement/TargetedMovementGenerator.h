@@ -68,6 +68,9 @@ class TargetedMovementGeneratorMedium
 
         float m_fOffset;
         float m_fAngle;
+        // Follow exactly onto the target's position (no bounding radius, collision shift or
+        // extrapolation). Used by party bots that stack on their leader.
+        bool m_bExactPosition = false;
         bool m_bRecalculateTravel : 1;
         bool m_bTargetReached : 1;
         bool m_bReachable;
@@ -135,8 +138,11 @@ class FollowMovementGenerator : public TargetedMovementGeneratorMedium<T, Follow
     public:
         explicit FollowMovementGenerator(Unit &target)
             : TargetedMovementGeneratorMedium<T, FollowMovementGenerator<T> >(target){}
-        FollowMovementGenerator(Unit &target, float offset, float angle)
-            : TargetedMovementGeneratorMedium<T, FollowMovementGenerator<T> >(target, offset, angle) {}
+        FollowMovementGenerator(Unit &target, float offset, float angle, bool exactPosition = false)
+            : TargetedMovementGeneratorMedium<T, FollowMovementGenerator<T> >(target, offset, angle)
+        {
+            this->m_bExactPosition = exactPosition;
+        }
         ~FollowMovementGenerator() {}
 
         MovementGeneratorType GetMovementGeneratorType() const { return FOLLOW_MOTION_TYPE; }

@@ -444,7 +444,7 @@ void MotionMaster::MoveChase(Unit* target, float dist, float angle)
     }
 }
 
-void MotionMaster::MoveFollow(Unit* target, float dist, float angle)
+void MotionMaster::MoveFollow(Unit* target, float dist, float angle, bool exactPosition)
 {
     if (m_owner->HasUnitState(UNIT_STATE_LOST_CONTROL))
         return;
@@ -458,9 +458,9 @@ void MotionMaster::MoveFollow(Unit* target, float dist, float angle)
     DEBUG_FILTER_LOG(LOG_FILTER_AI_AND_MOVEGENSS, "%s follow to %s", m_owner->GetGuidStr().c_str(), target->GetGuidStr().c_str());
 
     if (m_owner->IsPlayer())
-        Mutate(new FollowMovementGenerator<Player>(*target, dist, angle));
+        Mutate(new FollowMovementGenerator<Player>(*target, dist, angle, exactPosition));
     else
-        Mutate(new FollowMovementGenerator<Creature>(*target, dist, angle));
+        Mutate(new FollowMovementGenerator<Creature>(*target, dist, angle, exactPosition));
 }
 
 void MotionMaster::MovePoint(uint32 id, float x, float y, float z, uint32 options, float speed, float finalOrientation)

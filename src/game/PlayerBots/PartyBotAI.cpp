@@ -619,6 +619,14 @@ void PartyBotAI::OnPlayerLogin()
 
 void PartyBotAI::UpdateAI(uint32 const diff)
 {
+    if (m_initialized && me->IsInWorld())
+    {
+        if (m_followMode == PB_FOLLOW_STACKED && !m_holdPosition)
+            ReactToLeaderMovement();
+
+        FaceCombatTarget();
+    }
+
     m_updateTimer.Update(diff);
     if (m_updateTimer.Passed())
         m_updateTimer.Reset(PB_UPDATE_INTERVAL);
@@ -816,8 +824,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (!me->IsInCombat())
     {
-        // Stacked bots do not sit down to eat while the leader is walking away.
-        if (!(stackedFollow && pLeader->IsMoving()) && DrinkAndEat())
+        // Stacked bots only eat/drink once they are on the leader and the leader stands still.
+        if (!(stackedFollow && (pLeader->IsMoving() || !me->IsWithinDist(pLeader, PB_STACK_DIST, true, SizeFactor::None))) &&
+            DrinkAndEat())
         {
             if (!me->IsWithinDistInMap(pLeader, 100.0f))
             {
@@ -1002,12 +1011,34 @@ void PartyBotAI::OrderFollow()
 {
     SetHoldPosition(false);
     SetFollowMode(PB_FOLLOW_ARRIVE);
+    BreakActionsAndFollowNow();
 }
 
 void PartyBotAI::OrderStackedFollow(bool stacked)
 {
     SetHoldPosition(false);
     SetFollowMode(stacked ? PB_FOLLOW_STACKED : PB_FOLLOW_LOOSE);
+    if (stacked)
+        BreakActionsAndFollowNow();
+}
+
+// Follow orders win over whatever the bot is doing: stop casting, eating and drinking,
+// stand up and start moving to the leader right away (not on the next AI update).
+void PartyBotAI::BreakActionsAndFollowNow()
+{
+    if (!me->IsAlive() || me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+        return;
+
+    me->InterruptNonMeleeSpells(false);
+    me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
+    me->RemoveAurasDueToSpell(PB_SPELL_DRINK);
+    if (me->GetStandState() != UNIT_STAND_STATE_STAND)
+        me->SetStandState(UNIT_STAND_STATE_STAND);
+    m_isBuffing = false;
+
+    if (Player* pLeader = GetPartyLeader())
+        if (pLeader->IsInWorld() && me->IsInMap(pLeader))
+            StartFollowing(pLeader);
 }
 
 static char const* GetPartyBotFollowModeName(PartyBotFollowMode mode)
@@ -1065,7 +1096,50 @@ void PartyBotAI::StartFollowing(Player* pLeader)
     if (m_followMode == PB_FOLLOW_LOOSE)
         me->GetMotionMaster()->MoveFollow(pLeader, urand(PB_MIN_FOLLOW_DIST, PB_MAX_FOLLOW_DIST), frand(PB_MIN_FOLLOW_ANGLE, PB_MAX_FOLLOW_ANGLE));
     else
-        me->GetMotionMaster()->MoveFollow(pLeader, 0.0f, 0.0f);
+        me->GetMotionMaster()->MoveFollow(pLeader, 0.0f, 0.0f, true);
+}
+
+// Checked every world tick for every bot: when standing, always face the hostile target it is
+// attacking or casting at (like a mob turns to its target), if it is in line of sight.
+void PartyBotAI::FaceCombatTarget()
+{
+    if (!me->IsAlive() || me->IsMoving() || me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+        return;
+
+    Unit* pTarget = me->GetVictim();
+    if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+        if (Unit* pSpellTarget = pSpell->m_targets.getUnitTarget())
+            if (pSpellTarget != me && me->IsHostileTo(pSpellTarget))
+                pTarget = pSpellTarget;
+
+    if (!pTarget || pTarget == me || !pTarget->IsAlive() || !pTarget->IsInMap(me))
+        return;
+
+    if (!me->HasInArc(pTarget, M_PI_F / 3) && me->IsWithinLOSInMap(pTarget))
+        me->SetFacingToObject(pTarget);
+}
+
+// Toggle: checked every world tick. When the leader starts moving, drop any cast that would
+// keep the bot in place and run the full AI on the next tick so it follows at once.
+void PartyBotAI::ReactToLeaderMovement()
+{
+    Player* pLeader = GetPartyLeader();
+    bool const leaderMoving = pLeader && pLeader->IsInWorld() && pLeader->IsMoving();
+    bool const startedMoving = leaderMoving && !m_leaderWasMoving;
+    m_leaderWasMoving = leaderMoving;
+
+    // Not while paused (an active pause keeps the update timer longer than one interval).
+    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > PB_UPDATE_INTERVAL)
+        return;
+
+    if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+        if (pSpell->getState() == SPELL_STATE_PREPARING)
+            me->InterruptSpell(CURRENT_GENERIC_SPELL);
+
+    if (me->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+        me->InterruptSpell(CURRENT_CHANNELED_SPELL);
+
+    WakeUp();
 }
 
 void PartyBotAI::SetHoldPosition(bool hold)

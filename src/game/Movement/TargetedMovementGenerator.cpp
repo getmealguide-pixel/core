@@ -32,10 +32,20 @@
 #include "Geometry.h"
 #include "Utilities/Random.h"
 
+// Distance at which an exact-position follower counts as being on the target.
+#define EXACT_FOLLOW_TOLERANCE 0.3f
+// Distance a standing exact-position follower may be off the target before it moves again.
+#define EXACT_FOLLOW_RESTART_DIST 1.0f
+
 //-----------------------------------------------//
 template<class T, typename D>
 bool TargetedMovementGeneratorMedium<T, D>::IsFarEnoughToMoveStationaryFollower(T &owner) const
 {
+    // a standing exact follower only moves again once it is clearly off the target, so it does not
+    // keep re-launching tiny moves (which would block turning to face enemies)
+    if (m_bExactPosition)
+        return !i_target->IsWithinDist(&owner, EXACT_FOLLOW_RESTART_DIST, true, SizeFactor::None);
+
     return !i_target->IsWithinDist(&owner, 1.4f * m_fOffset);
 }
 
@@ -620,6 +630,11 @@ void FollowMovementGenerator<T>::_setTargetLocation(T &owner)
         i_target->GetNearPoint2D(x, y, m_fOffset, m_fAngle + i_target->GetOrientation());
         z = srcZ;
     }
+    else if (m_bExactPosition)
+    {
+        // stand exactly where the target stands
+        i_target->GetPosition(x, y, z);
+    }
     else
     {
         float o;
@@ -684,11 +699,13 @@ void FollowMovementGenerator<T>::_setTargetLocation(T &owner)
         init.SetVelocity(speed);
     }
     else
-        init.SetWalk(dist < 2.0f);
+        init.SetWalk(!m_bExactPosition && dist < 2.0f); // exact followers always run, never walk the last steps
 
-    init.SetFacing(i_target->GetOrientation());
+    if (!m_bExactPosition) // exact followers keep their own facing (their AI faces enemies)
+        init.SetFacing(i_target->GetOrientation());
     init.Launch();
-    m_checkDistanceTimer.Reset(500);
+    // exact followers re-check every update so they react at once when the target moves
+    m_checkDistanceTimer.Reset(m_bExactPosition ? 0 : 500);
 }
 
 template<class T>
@@ -726,10 +743,11 @@ bool FollowMovementGenerator<T>::Update(T &owner, uint32 const&  time_diff)
     m_checkDistanceTimer.Update(time_diff);
     if (m_checkDistanceTimer.Passed())
     {
-        m_checkDistanceTimer.Reset(100);
+        m_checkDistanceTimer.Reset(m_bExactPosition ? 0 : 100);
         //More distance let have better performance, less distance let have more sensitive reaction at target move.
         if (!owner.movespline->Finalized() &&
-                 ((!m_fOffset && i_target->IsWithinDist(&owner, 0.0f)) ||
+                 ((m_bExactPosition && i_target->IsWithinDist(&owner, EXACT_FOLLOW_TOLERANCE, true, SizeFactor::None)) ||
+                 (!m_bExactPosition && !m_fOffset && i_target->IsWithinDist(&owner, 0.0f)) ||
                  (i_target->IsPlayer() && !i_target->IsMoving() &&
                  Geometry::GetDistance3D(owner.movespline->FinalDestination(), i_target->GetPosition()) > (m_fOffset + owner.GetObjectBoundingRadius() + i_target->GetObjectBoundingRadius() + 0.5f) &&
                  Geometry::GetDistance3D(owner.GetPosition(), i_target->GetPosition()) <= (m_fOffset + owner.GetObjectBoundingRadius() + i_target->GetObjectBoundingRadius() + 0.5f))))
@@ -770,7 +788,8 @@ bool FollowMovementGenerator<T>::Update(T &owner, uint32 const&  time_diff)
     {
         MovementInform(owner);
 
-        if (m_fAngle == 0.f && !owner.HasInArc(i_target.getTarget(), 0.01f))
+        // exact followers stand inside the target; their own AI decides where to face
+        if (!m_bExactPosition && m_fAngle == 0.f && !owner.HasInArc(i_target.getTarget(), 0.01f))
             owner.SetInFront(i_target.getTarget());
 
         if (!m_bTargetReached)

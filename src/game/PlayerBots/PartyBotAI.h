@@ -99,6 +99,9 @@ public:
     void SetFollowMode(PartyBotFollowMode mode);
     void UpdateFollowMode(Player const* pLeader);
     void StartFollowing(Player* pLeader);
+    void ReactToLeaderMovement();
+    void BreakActionsAndFollowNow();
+    void FaceCombatTarget();
     void SetHoldPosition(bool hold);
     void SetHoldSpotHere();
     bool ReturnToHoldSpot();
@@ -145,6 +148,7 @@ public:
     bool m_holdPosition = false;
     PartyBotFollowMode m_followMode = PB_FOLLOW_LOOSE;
     bool m_arrivedAtLeader = false;
+    bool m_leaderWasMoving = false;
     bool m_returningToHoldSpot = false;
     uint32 m_returnProgressTime = 0;
     float m_returnBestDistance = 0.0f;
