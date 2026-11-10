@@ -1523,70 +1523,6 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
     return true;
 }
 
-bool HandlePartyBotComeToMeHelper(Player* pBot, Player* pPlayer)
-{
-    if (pBot->AI() && pBot->IsAlive() && pBot->IsInMap(pPlayer) && !pBot->HasUnitState(UNIT_STATE_NO_FREE_MOVE))
-    {
-        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pBot))
-        {
-            pAI->SetHoldPosition(false);
-
-            if (pBot->GetVictim())
-                StopPartyBotAttackHelper(pAI, pBot);
-
-            if (pBot->GetStandState() != UNIT_STAND_STATE_STAND)
-                pBot->SetStandState(UNIT_STAND_STATE_STAND);
-
-            pBot->InterruptSpellsWithInterruptFlags(SPELL_INTERRUPT_FLAG_MOVEMENT);
-            pBot->MonsterMove(pPlayer->GetPositionX(), pPlayer->GetPositionY(), pPlayer->GetPositionZ());
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool ChatHandler::HandlePartyBotComeToMeCommand(char* args)
-{
-    Player* pPlayer = GetSession()->GetPlayer();
-    Player* pTarget = GetSelectedPlayer();
-
-    bool ok = false;
-
-    if (pTarget && pTarget != pPlayer)
-    {
-        if (ok = HandlePartyBotComeToMeHelper(pTarget, pPlayer))
-            PSendSysMessage("%s is coming to your position.", pTarget->GetName());
-        else
-            PSendSysMessage("%s is not a party bot or it cannot move.", pTarget->GetName());
-        return ok;
-    }
-    else if (Group* pGroup = pPlayer->GetGroup())
-    {
-        bool ok = false;
-        for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
-        {
-            if (Player* pMember = itr->getSource())
-            {
-                if (pMember == pPlayer)
-                    continue;
-
-                ok = HandlePartyBotComeToMeHelper(pMember, pPlayer) || ok;
-            }
-        }
-
-        if (ok)
-            SendSysMessage("All party bots are coming to your position.");
-        else
-            SendSysMessage("There are no party bots in the group or they cannot move.");
-        return ok;
-    }
-
-    SendSysMessage("You are not in a group.");
-    SetSentErrorMessage(true);
-    return false;
-}
-
 bool HandlePartyBotUseGObjectHelper(Player* pTarget, GameObject* pGo)
 {
     if (pTarget->AI())
@@ -1757,31 +1693,46 @@ bool ChatHandler::HandlePartyBotUnpauseCommand(char* args)
     return HandlePartyBotPauseHelper(args, false);
 }
 
-bool HandlePartyBotHoldApplyHelper(Player* pTarget, bool hold)
+enum PartyBotMoveOrder : uint8
 {
-    if (pTarget->AI())
+    PB_ORDER_STAY,
+    PB_ORDER_FOLLOW,
+    PB_ORDER_TOGGLE,
+};
+
+static bool HandlePartyBotMoveOrderApplyHelper(Player* pTarget, uint8 order, bool stacked)
+{
+    PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget);
+    if (!pAI)
+        return false;
+
+    switch (order)
     {
-        if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
-        {
-            pAI->SetHoldPosition(hold);
-            return true;
-        }
+        case PB_ORDER_STAY:
+            pAI->OrderStay();
+            break;
+        case PB_ORDER_FOLLOW:
+            pAI->OrderFollow();
+            break;
+        case PB_ORDER_TOGGLE:
+            pAI->OrderStackedFollow(stacked);
+            break;
     }
 
-    return false;
+    return true;
 }
 
-bool ChatHandler::HandlePartyBotHoldHelper(char* args, bool hold)
+bool ChatHandler::HandlePartyBotMoveOrderHelper(char* args, uint8 order)
 {
     bool all = false;
     if (char* arg1 = ExtractArg(&args))
         all = strcmp(arg1, "all") == 0;
 
-    char const* const order = hold ? "holding position" : "following";
+    Player* pPlayer = GetSession()->GetPlayer();
+    std::vector<Player*> bots;
 
     if (all)
     {
-        Player* pPlayer = GetSession()->GetPlayer();
         Group* pGroup = pPlayer->GetGroup();
         if (!pGroup)
         {
@@ -1790,23 +1741,16 @@ bool ChatHandler::HandlePartyBotHoldHelper(char* args, bool hold)
             return false;
         }
 
-        bool success = false;
         for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
-        {
             if (Player* pMember = itr->getSource())
-            {
-                if (pMember == pPlayer)
-                    continue;
+                if (pMember != pPlayer && dynamic_cast<PartyBotAI*>(pMember->AI()))
+                    bots.push_back(pMember);
 
-                if (HandlePartyBotHoldApplyHelper(pMember, hold))
-                    success = true;
-            }
-        }
-
-        if (success)
-            PSendSysMessage("All party bots %s.", order);
-        else
+        if (bots.empty())
+        {
             SendSysMessage("No party bots in group.");
+            return true;
+        }
     }
     else
     {
@@ -1818,23 +1762,60 @@ bool ChatHandler::HandlePartyBotHoldHelper(char* args, bool hold)
             return false;
         }
 
-        if (HandlePartyBotHoldApplyHelper(pTarget, hold))
-            PSendSysMessage("%s %s.", pTarget->GetName(), order);
-        else
+        if (!dynamic_cast<PartyBotAI*>(pTarget->AI()))
+        {
             SendSysMessage("Target is not a party bot.");
+            return true;
+        }
+
+        bots.push_back(pTarget);
     }
+
+    // Toggle: if any of the commanded bots is not stacked yet, stack them all; otherwise unstack.
+    bool stacked = false;
+    if (order == PB_ORDER_TOGGLE)
+        for (Player* pBot : bots)
+            if (!static_cast<PartyBotAI*>(pBot->AI())->IsStackedFollowing())
+                stacked = true;
+
+    for (Player* pBot : bots)
+        HandlePartyBotMoveOrderApplyHelper(pBot, order, stacked);
+
+    char const* result;
+    switch (order)
+    {
+        case PB_ORDER_STAY:
+            result = "holding position";
+            break;
+        case PB_ORDER_FOLLOW:
+            result = "coming to you, then following";
+            break;
+        default:
+            result = stacked ? "following stacked (toggle on)" : "following loosely (toggle off)";
+            break;
+    }
+
+    if (all)
+        PSendSysMessage("All party bots %s.", result);
+    else
+        PSendSysMessage("%s %s.", bots.front()->GetName(), result);
 
     return true;
 }
 
 bool ChatHandler::HandlePartyBotStayCommand(char* args)
 {
-    return HandlePartyBotHoldHelper(args, true);
+    return HandlePartyBotMoveOrderHelper(args, PB_ORDER_STAY);
 }
 
 bool ChatHandler::HandlePartyBotFollowCommand(char* args)
 {
-    return HandlePartyBotHoldHelper(args, false);
+    return HandlePartyBotMoveOrderHelper(args, PB_ORDER_FOLLOW);
+}
+
+bool ChatHandler::HandlePartyBotToggleCommand(char* args)
+{
+    return HandlePartyBotMoveOrderHelper(args, PB_ORDER_TOGGLE);
 }
 
 bool ChatHandler::HandlePartyBotPullCommand(char* args)

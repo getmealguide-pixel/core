@@ -32,6 +32,14 @@ enum PartyBotLayer : uint8
     PB_LAYER_FOLLOW,    // follow the leader
 };
 
+// How the follow layer follows the leader.
+enum PartyBotFollowMode : uint8
+{
+    PB_FOLLOW_LOOSE,   // spread out 3-6 yd around the leader
+    PB_FOLLOW_ARRIVE,  // run to the leader and stack; turns loose once the leader moves
+    PB_FOLLOW_STACKED, // "toggle": stay stacked on the leader all the time
+};
+
 class PartyBotAI : public CombatBotBaseAI
 {
 public:
@@ -82,6 +90,13 @@ public:
     PartyBotLayer SelectLayer() const;
     void SetActiveLayer(PartyBotLayer layer);
     void WakeUp();
+    void OrderStay();
+    void OrderFollow();
+    void OrderStackedFollow(bool stacked);
+    bool IsStackedFollowing() const { return m_followMode == PB_FOLLOW_STACKED; }
+    void SetFollowMode(PartyBotFollowMode mode);
+    void UpdateFollowMode(Player const* pLeader);
+    void StartFollowing(Player* pLeader);
     void SetHoldPosition(bool hold);
     void SetHoldSpotHere();
     bool ReturnToHoldSpot();
@@ -125,6 +140,8 @@ public:
     float m_o = 0.0f;
     bool m_resetSpellData = false;
     bool m_holdPosition = false;
+    PartyBotFollowMode m_followMode = PB_FOLLOW_LOOSE;
+    bool m_arrivedAtLeader = false;
     bool m_returningToHoldSpot = false;
     uint32 m_returnStartTime = 0;
     uint32 m_holdMapId = 0;

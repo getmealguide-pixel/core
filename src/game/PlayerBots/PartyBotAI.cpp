@@ -44,6 +44,7 @@ enum PartyBotSpells
 #define PB_MAX_FOLLOW_DIST 6.0f
 #define PB_MIN_FOLLOW_ANGLE 0.0f
 #define PB_MAX_FOLLOW_ANGLE 6.0f
+#define PB_STACK_DIST 1.5f
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
 #define PB_HOLD_RETURN_TIMEOUT (10 * IN_MILLISECONDS)
 
@@ -899,12 +900,15 @@ void PartyBotAI::UpdateAI(uint32 const diff)
             me->RemoveSpellsCausingAura(SPELL_AURA_MOUNTED);
     }
 
+    if (!pVictim && mayFollow)
+        UpdateFollowMode(pLeader);
+
     if (!me->IsMoving())
     {
         if (!pVictim)
         {
             if (mayFollow && me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
-                me->GetMotionMaster()->MoveFollow(pLeader, urand(PB_MIN_FOLLOW_DIST, PB_MAX_FOLLOW_DIST), frand(PB_MIN_FOLLOW_ANGLE, PB_MAX_FOLLOW_ANGLE));
+                StartFollowing(pLeader);
         }
         else
         {
@@ -963,6 +967,80 @@ void PartyBotAI::SetActiveLayer(PartyBotLayer layer)
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %s -> %s", me->GetName(),
         GetPartyBotLayerName(m_activeLayer), GetPartyBotLayerName(layer));
     m_activeLayer = layer;
+}
+
+void PartyBotAI::OrderStay()
+{
+    SetFollowMode(PB_FOLLOW_LOOSE);
+    SetHoldPosition(true);
+}
+
+void PartyBotAI::OrderFollow()
+{
+    SetHoldPosition(false);
+    SetFollowMode(PB_FOLLOW_ARRIVE);
+}
+
+void PartyBotAI::OrderStackedFollow(bool stacked)
+{
+    SetHoldPosition(false);
+    SetFollowMode(stacked ? PB_FOLLOW_STACKED : PB_FOLLOW_LOOSE);
+}
+
+static char const* GetPartyBotFollowModeName(PartyBotFollowMode mode)
+{
+    switch (mode)
+    {
+        case PB_FOLLOW_ARRIVE:
+            return "arrive";
+        case PB_FOLLOW_STACKED:
+            return "stacked";
+        default:
+            return "loose";
+    }
+}
+
+void PartyBotAI::SetFollowMode(PartyBotFollowMode mode)
+{
+    m_arrivedAtLeader = false;
+
+    if (mode == m_followMode)
+        return;
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: follow mode %s -> %s", me->GetName(),
+        GetPartyBotFollowModeName(m_followMode), GetPartyBotFollowModeName(mode));
+    m_followMode = mode;
+
+    // Drop the current follow so the next update restarts it with the new distance.
+    if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+    {
+        me->StopMoving();
+        me->GetMotionMaster()->Clear(false, true);
+        me->GetMotionMaster()->MoveIdle();
+    }
+}
+
+// "follow": once the bot has stacked on the leader and the leader moves, spread out (loose).
+void PartyBotAI::UpdateFollowMode(Player const* pLeader)
+{
+    if (m_followMode != PB_FOLLOW_ARRIVE)
+        return;
+
+    if (!m_arrivedAtLeader)
+    {
+        if (me->IsWithinDist(pLeader, PB_STACK_DIST, true, SizeFactor::None))
+            m_arrivedAtLeader = true;
+    }
+    else if (pLeader->IsMoving())
+        SetFollowMode(PB_FOLLOW_LOOSE);
+}
+
+void PartyBotAI::StartFollowing(Player* pLeader)
+{
+    if (m_followMode == PB_FOLLOW_LOOSE)
+        me->GetMotionMaster()->MoveFollow(pLeader, urand(PB_MIN_FOLLOW_DIST, PB_MAX_FOLLOW_DIST), frand(PB_MIN_FOLLOW_ANGLE, PB_MAX_FOLLOW_ANGLE));
+    else
+        me->GetMotionMaster()->MoveFollow(pLeader, 0.0f, 0.0f);
 }
 
 void PartyBotAI::SetHoldPosition(bool hold)
