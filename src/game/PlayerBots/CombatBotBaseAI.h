@@ -140,6 +140,13 @@ public:
     void EquipAmmoBag();  // hunters: best allowed quiver/ammo pouch for the ranged weapon and level
     void CheckAmmoBagHaste(); // hunters: quiver/pouch haste aura missing -> re-apply once, log
     bool m_ammoBagHasteRetried = false;
+    // Highest-level learned spell whose name starts with the prefix and that creates an item
+    // ("Conjure Water", "Conjure Mana", "Create Healthstone"); its item via GetCreatedItemId.
+    SpellEntry const* GetBestCreateItemSpell(char const* namePrefix) const;
+    static uint32 GetCreatedItemId(SpellEntry const* pSpellEntry);
+    // A player opened a trade with this bot (16b): mage puts 20 conjured food (+ 20 water for mana
+    // users), warlock a healthstone, in the window. Free items, no cast.
+    void FillSupplyTrade();
     void EnsureSpellReagents(SpellEntry const* pSpellEntry); // free reagents/totems, before the cast
     uint8 GetHighestHonorRankFromEquippedItems() const;
     void UpdateVisualHonorRankBasedOnItems();

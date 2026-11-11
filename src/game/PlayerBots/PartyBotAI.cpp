@@ -240,6 +240,24 @@ bool PartyBotAI::DrinkAndEat()
             me->GetName(), needToDrink ? (needToEat ? "eat and drink" : "drink") : "eat", healthPct, manaPct,
             GetFoodSpellId(me, false), GetFoodSpellId(me, true));
 
+    // Mage: Evocation first (when ready), drink afterwards for what is still missing.
+    if (me->GetClass() == CLASS_MAGE && !isSitting && manaPct < PB_EAT_DRINK_START_PCT &&
+        m_spells.mage.pEvocation && CanTryToCastSpell(me, m_spells.mage.pEvocation))
+    {
+        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType())
+        {
+            me->StopMoving();
+            me->GetMotionMaster()->Clear(false, true);
+            me->GetMotionMaster()->MoveIdle();
+        }
+        if (DoCastSpell(me, m_spells.mage.pEvocation) == SPELL_CAST_OK)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: Evocation before drinking (mana %.0f%%)",
+                me->GetName(), manaPct);
+            return true;
+        }
+    }
+
     if (!isEating && needToEat)
     {
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType())
@@ -1209,6 +1227,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
             return;
         }
 
+        if (!groupFighting)
+            KeepManaGem();
+
         // Teleport to leader if too far away.
         if (mayFollow && !me->IsWithinDistInMap(pLeader, 100.0f) && !IsInDuel())
         {
@@ -1748,6 +1769,53 @@ void PartyBotAI::ReactToLeaderMovement()
         me->InterruptSpell(CURRENT_CHANNELED_SPELL);
 
     WakeUp();
+}
+
+// Mage, out of combat: carries the mana gem of its highest Conjure Mana spell (free, no cast).
+void PartyBotAI::KeepManaGem()
+{
+    if (me->GetClass() != CLASS_MAGE)
+        return;
+    SpellEntry const* pSpellEntry = GetBestCreateItemSpell("Conjure Mana");
+    if (!pSpellEntry)
+        return;
+    uint32 const itemId = GetCreatedItemId(pSpellEntry);
+    if (me->HasItemCount(itemId, 1))
+        return;
+    AddItemToInventory(itemId);
+    if (ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(itemId))
+        if (me->HasItemCount(itemId, 1))
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: gets %s", me->GetName(), pProto->Name1);
+}
+
+// Mage, in combat: uses its mana gem once the missing mana is at least the gem's best restore
+// (nothing wasted). Shares the 2 min cooldown with healthstones.
+bool PartyBotAI::UseManaGem()
+{
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+    {
+        Item* pItem = me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!pItem || strncmp(pItem->GetProto()->Name1, "Mana ", 5) != 0)
+            continue;
+        uint32 const spellId = pItem->GetProto()->Spells[0].SpellId;
+        SpellEntry const* pSpellEntry = spellId ? sSpellMgr.GetSpellEntry(spellId) : nullptr;
+        if (!pSpellEntry || !pSpellEntry->HasEffect(SPELL_EFFECT_ENERGIZE))
+            continue;
+        int32 const restore = pSpellEntry->EffectBasePoints[0] + pSpellEntry->EffectDieSides[0];
+        if (int32(me->GetMaxPower(POWER_MANA) - me->GetPower(POWER_MANA)) < restore ||
+            !me->IsSpellReady(pSpellEntry, pItem->GetProto()))
+            return false;
+        float const manaPct = me->GetPowerPercent(POWER_MANA);
+        std::string const name = pItem->GetProto()->Name1;
+        if (UseItemEffect(pItem))
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: uses %s (mana %.0f%%)", me->GetName(),
+                name.c_str(), manaPct);
+            return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 // Checked every world tick unless on stay: following the leader beats eating/drinking, so a
@@ -3439,6 +3507,9 @@ void PartyBotAI::UpdateInCombatAI_Mage()
 {
     if (Unit* pVictim = me->GetVictim())
     {
+        if (UseManaGem())
+            return;
+
         if (m_spells.mage.pCombustion &&
             CanTryToCastSpell(me, m_spells.mage.pCombustion))
         {

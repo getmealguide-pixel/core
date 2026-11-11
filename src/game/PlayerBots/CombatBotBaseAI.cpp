@@ -3,6 +3,7 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "Bag.h"
+#include "TradeData.h"
 #include "Group.h"
 #include "PlayerBotMgr.h"
 #include "Opcodes.h"
@@ -3502,6 +3503,111 @@ static SpellEntry const* GetTradeBuffSpell(ItemPrototype const* pProto)
     return nullptr;
 }
 
+#define PB_SUPPLY_TRADE_COUNT 20
+
+void CombatBotBaseAI::FillSupplyTrade()
+{
+    if (me->GetClass() != CLASS_MAGE && me->GetClass() != CLASS_WARLOCK)
+        return;
+    TradeData* pTrade = me->GetTradeData();
+    Player* pTrader = pTrade ? pTrade->GetTrader() : nullptr;
+    if (!pTrader)
+        return;
+
+    uint8 tradeSlot = 0;
+    std::string names;
+    auto offerItem = [&](uint32 itemId, uint32 count)
+    {
+        ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(itemId);
+        if (!pProto)
+            return;
+        if (pProto->MaxCount && pTrader->GetItemCount(itemId) >= pProto->MaxCount)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: %s already has %s", me->GetName(),
+                pTrader->GetName(), pProto->Name1);
+            return;
+        }
+        uint32 const have = me->GetItemCount(itemId);
+        if (have < count)
+            AddItemToInventory(itemId, count - have);
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            Item* pItem = me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (pItem && pItem->GetEntry() == itemId && pItem->GetCount() >= count)
+            {
+                auto data = std::make_unique<WorldPackets::Trade::SetTradeItem>();
+                data->tradeSlot = tradeSlot++;
+                data->bag = INVENTORY_SLOT_BAG_0;
+                data->slot = slot;
+                me->GetSession()->QueuePacket(std::move(data));
+                if (!names.empty())
+                    names += ", ";
+                names += std::to_string(count) + " " + pProto->Name1;
+                return;
+            }
+        }
+    };
+
+    auto offerConjured = [&](char const* spellPrefix, uint32 count)
+    {
+        if (SpellEntry const* pSpellEntry = GetBestCreateItemSpell(spellPrefix))
+            offerItem(GetCreatedItemId(pSpellEntry), count);
+        else
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: no %s spell learned", me->GetName(), spellPrefix);
+    };
+
+    if (me->GetClass() == CLASS_MAGE)
+    {
+        offerConjured("Conjure Food", PB_SUPPLY_TRADE_COUNT);
+        // Water only for mana users (by class: a druid in bear form still gets it).
+        if (pTrader->GetClass() != CLASS_WARRIOR && pTrader->GetClass() != CLASS_ROGUE)
+            offerConjured("Conjure Water", PB_SUPPLY_TRADE_COUNT);
+    }
+    else
+    {
+        // Healthstone by warlock level (trainer levels of Create Healthstone). Not via the learned
+        // spell: bots were found without it (cause unknown, 2026-11-11).
+        static struct { uint32 minLevel, itemId; } const healthstones[] =
+            { { 58, 9421 }, { 46, 5510 }, { 34, 5509 }, { 22, 5511 }, { 10, 5512 } };
+        for (auto const& entry : healthstones)
+        {
+            if (me->GetLevel() >= entry.minLevel)
+            {
+                offerItem(entry.itemId, 1);
+                break;
+            }
+        }
+    }
+
+    if (!names.empty())
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: puts %s in the trade with %s", me->GetName(),
+            names.c_str(), pTrader->GetName());
+}
+
+SpellEntry const* CombatBotBaseAI::GetBestCreateItemSpell(char const* namePrefix) const
+{
+    SpellEntry const* pBest = nullptr;
+    for (auto const& itr : me->GetSpellMap())
+    {
+        if (itr.second.state == PLAYERSPELL_REMOVED || itr.second.disabled)
+            continue;
+        SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(itr.first);
+        if (!pSpellEntry || pSpellEntry->SpellName[0].rfind(namePrefix, 0) != 0 || !GetCreatedItemId(pSpellEntry))
+            continue;
+        if (!pBest || pBest->spellLevel < pSpellEntry->spellLevel)
+            pBest = pSpellEntry;
+    }
+    return pBest;
+}
+
+uint32 CombatBotBaseAI::GetCreatedItemId(SpellEntry const* pSpellEntry)
+{
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (pSpellEntry->Effect[i] == SPELL_EFFECT_CREATE_ITEM && pSpellEntry->EffectItemType[i])
+            return uint32(pSpellEntry->EffectItemType[i]);
+    return 0;
+}
+
 void CombatBotBaseAI::EquipOrUseNewItem()
 {
     std::unordered_set<uint32> usedSpells; // one of each buff per trade
@@ -3927,6 +4033,8 @@ void CombatBotBaseAI::OnPacketReceived(WorldPacket const* packet)
                 auto data = std::make_unique<NullClientPacket>(CMSG_BEGIN_TRADE);
                 me->GetSession()->QueuePacket(std::move(data));
             }
+            else if (status == TRADE_STATUS_OPEN_WINDOW)
+                FillSupplyTrade();
             else if (status == TRADE_STATUS_TRADE_ACCEPT)
             {
                 auto data = std::make_unique<WorldPackets::Trade::AcceptTrade>();

@@ -202,6 +202,9 @@ public:
     void UpdateForcedAoE();
 
     void MaintainHunterPet();
+    // Task 16b: mage own mana gem (kept out of combat, used in combat).
+    void KeepManaGem();
+    bool UseManaGem();
     void CommandPetAttack(Unit* pVictim);
 
     bool CheckForDispelTargets();
