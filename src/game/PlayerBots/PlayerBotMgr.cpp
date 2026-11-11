@@ -20,6 +20,7 @@
 #include "Spell.h"
 
 #include <algorithm>
+#include <sstream>
 
 INSTANTIATE_SINGLETON_1(PlayerBotMgr);
 
@@ -2034,7 +2035,8 @@ static bool HandlePartyBotMoveOrderApplyHelper(Player* pTarget, Player const* pL
             pAI->OrderStackedFollow(stacked);
             break;
         case PB_ORDER_COMESTAY:
-            pAI->OrderComeStay(pLeader);
+            pAI->OrderHoldSpot(pLeader->GetMapId(), pLeader->GetPositionX(), pLeader->GetPositionY(),
+                pLeader->GetPositionZ());
             break;
     }
 
@@ -2143,6 +2145,127 @@ bool ChatHandler::HandlePartyBotToggleCommand(char* args)
 bool ChatHandler::HandlePartyBotComeStayCommand(char* args)
 {
     return HandlePartyBotMoveOrderHelper(args, PB_ORDER_COMESTAY);
+}
+
+void PlayerBotMgr::SetMoveHereChoice(ObjectGuid leaderGuid, MoveHereChoice const& choice)
+{
+    std::lock_guard<std::mutex> guard(m_moveHereLock);
+    m_moveHereChoices[leaderGuid] = choice;
+}
+
+static std::string ToLowerCopy(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return text;
+}
+
+// Called when the leader casts aedm on the ground: the chosen party bots hold the clicked spot.
+void PlayerBotMgr::OrderMoveHere(Player* pLeader, float x, float y, float z)
+{
+    MoveHereChoice choice;
+    {
+        std::lock_guard<std::mutex> guard(m_moveHereLock);
+        auto itr = m_moveHereChoices.find(pLeader->GetObjectGuid());
+        if (itr != m_moveHereChoices.end())
+            choice = itr->second;
+    }
+
+    ChatHandler handler(pLeader->GetSession());
+    Group* pGroup = pLeader->GetGroup();
+    if (!pGroup)
+    {
+        handler.SendSysMessage("Move here: you are not in a group.");
+        return;
+    }
+
+    std::string moved;
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || pMember == pLeader || !pMember->IsInMap(pLeader))
+            continue;
+        PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI());
+        if (!pAI)
+            continue;
+
+        std::string const name = ToLowerCopy(pMember->GetName());
+        bool const chosen = choice.all ||
+            (choice.roleMask & (1 << pAI->GetRole())) ||
+            (choice.selected && pLeader->GetSelectionGuid() == pMember->GetObjectGuid()) ||
+            std::find(choice.names.begin(), choice.names.end(), name) != choice.names.end();
+        if (!chosen)
+            continue;
+
+        GetCommandedPartyBotAI(pMember)->OrderHoldSpot(pLeader->GetMapId(), x, y, z);
+        moved += moved.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
+    }
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Order] %s: move here (%.1f, %.1f, %.1f) map %u -> %s",
+        pLeader->GetName(), x, y, z, pLeader->GetMapId(), moved.empty() ? "nobody" : moved.c_str());
+    if (moved.empty())
+        handler.SendSysMessage("Move here: no chosen bot in your group (see .partybot moveto).");
+    else
+        handler.PSendSysMessage("Move here: %s.", moved.c_str());
+}
+
+// .partybot moveto <words>: who walks to the spot of the next aedm cast. Words (spaces or commas):
+// all, tank, melee, ranged, healer, target (the bot selected at cast time), or bot names.
+bool ChatHandler::HandlePartyBotMoveToCommand(char* args)
+{
+    Player* pPlayer = GetSession()->GetPlayer();
+    PlayerBotMgr::MoveHereChoice choice;
+    choice.all = false;
+
+    std::string text = args ? args : "";
+    std::replace(text.begin(), text.end(), ',', ' ');
+    std::istringstream words(text);
+    std::string word;
+    std::string summary;
+    while (words >> word)
+    {
+        std::string const lower = ToLowerCopy(word);
+        if (lower == "all")
+            choice.all = true;
+        else if (lower == "tank" || lower == "tanks")
+            choice.roleMask |= 1 << ROLE_TANK;
+        else if (lower == "melee")
+            choice.roleMask |= 1 << ROLE_MELEE_DPS;
+        else if (lower == "ranged" || lower == "range")
+            choice.roleMask |= 1 << ROLE_RANGE_DPS;
+        else if (lower == "healer" || lower == "healers")
+            choice.roleMask |= 1 << ROLE_HEALER;
+        else if (lower == "target")
+            choice.selected = true;
+        else
+        {
+            bool found = false;
+            if (Group* pGroup = pPlayer->GetGroup())
+                for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+                    if (Player* pMember = itr->getSource())
+                        if (dynamic_cast<PartyBotAI*>(pMember->AI()) && ToLowerCopy(pMember->GetName()) == lower)
+                            found = true;
+            if (!found)
+            {
+                PSendSysMessage("Unknown word '%s'. Use: all, tank, melee, ranged, healer, target, or a party bot's name.",
+                    word.c_str());
+                SetSentErrorMessage(true);
+                return false;
+            }
+            choice.names.push_back(lower);
+        }
+        summary += summary.empty() ? lower : std::string(", ") + lower;
+    }
+
+    if (summary.empty())
+    {
+        SendSysMessage("Usage: .partybot moveto all|tank|melee|ranged|healer|target|<bot name> (combine with spaces or commas)");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    sPlayerBotMgr.SetMoveHereChoice(pPlayer->GetObjectGuid(), choice);
+    PSendSysMessage("Move here: %s. Cast aedm and click the spot.", summary.c_str());
+    return true;
 }
 
 bool ChatHandler::HandlePartyBotPullCommand(char* args)

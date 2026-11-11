@@ -9,6 +9,8 @@
 
 #include <vector>
 #include <memory>
+#include <mutex>
+#include <string>
 
 class PlayerBotAI;
 class WorldSession;
@@ -104,6 +106,18 @@ class PlayerBotMgr
         bool IsChatBot(uint32 playerGuid);
         bool IsSavingAllowed() { return m_confAllowSaving; }
 
+        // "Move here": the leader casts the ground spell aedm (PB_SPELL_MOVE_HERE) and the bots
+        // chosen with .partybot moveto walk to the clicked spot and hold it.
+        struct MoveHereChoice
+        {
+            bool all = true;                // default until the leader sets a choice
+            bool selected = false;          // the bot the leader has selected at cast time
+            uint32 roleMask = 0;            // 1 << CombatBotRoles
+            std::vector<std::string> names; // bot names, lower case
+        };
+        void SetMoveHereChoice(ObjectGuid leaderGuid, MoveHereChoice const& choice);
+        void OrderMoveHere(Player* pLeader, float x, float y, float z);
+
         uint32 GenBotAccountId() { return ++m_maxAccountId; }
         PlayerBotStats& GetStats(){ return m_stats; }
         void Start() { m_confEnableRandomBots = true; }
@@ -128,7 +142,12 @@ class PlayerBotMgr
         bool m_confDebug;
         bool m_confEnableRandomBots;
         bool m_confBattleBotAutoJoin;
+
+        std::mutex m_moveHereLock;  // commands and map threads
+        std::map<ObjectGuid, MoveHereChoice> m_moveHereChoices;
 };
+
+#define PB_SPELL_MOVE_HERE 30758 // "aedm": instant ground-target spell known by the 1.12 client
 
 #define sPlayerBotMgr MaNGOS::Singleton<PlayerBotMgr>::Instance()
 #endif

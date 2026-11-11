@@ -103,7 +103,7 @@ public:
     void WakeUp();
     char const* GetLayerName(PartyBotLayer layer) const;
     void OrderStay();
-    void OrderComeStay(Player const* pLeader);
+    void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
     void OrderStackedFollow(bool stacked);
     bool IsStackedFollowing() const { return m_followMode == PB_FOLLOW_STACKED; }

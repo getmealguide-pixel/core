@@ -118,6 +118,7 @@ ChatCommand * ChatHandler::getCommandTable()
         { "followme",   SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotFollowCommand,      "", nullptr },
         { "toggle",     SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotToggleCommand,      "", nullptr },
         { "comestay",   SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotComeStayCommand,    "", nullptr },
+        { "moveto",     SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotMoveToCommand,      "", nullptr },
         { "unequip",    SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotUnequipCommand,     "", nullptr },
         { "remove",     SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotRemoveCommand,      "", nullptr },
         { nullptr,      0,                      false, nullptr,                                        "", nullptr },

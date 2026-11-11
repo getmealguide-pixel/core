@@ -27,6 +27,7 @@
 #include "Log.h"
 #include "Opcodes.h"
 #include "Spell.h"
+#include "PlayerBotMgr.h"
 #include "SpellAuras.h"
 #include "GameObject.h"
 #include "Map.h"
@@ -276,6 +277,10 @@ void WorldSession::HandleCastSpellOpcode(WorldPackets::Spell::CastSpell const& p
 
     // client provided targets
     const_cast<SpellCastTargets&>(packet.targets).PrepareForSpellSystem(_player);
+
+    // Party bots "move here": the leader's ground click with aedm (the spell itself does nothing).
+    if (packet.spellId == PB_SPELL_MOVE_HERE && (packet.targets.m_targetMask & TARGET_FLAG_DEST_LOCATION))
+        sPlayerBotMgr.OrderMoveHere(_player, packet.targets.m_destX, packet.targets.m_destY, packet.targets.m_destZ);
     SpellEntry const* originalSpellInfo = spellInfo;
 
     // auto-selection buff level base at target level (in spellInfo)

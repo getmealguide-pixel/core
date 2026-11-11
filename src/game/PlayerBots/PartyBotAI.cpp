@@ -1057,16 +1057,17 @@ void PartyBotAI::OrderStay()
     SetHoldPosition(true);
 }
 
-void PartyBotAI::OrderComeStay(Player const* pLeader)
+// Hold a given spot (comestay: the leader's position; aedm "move here": the clicked ground);
+// ReturnToHoldSpot walks there and keeps the bot there like stay.
+void PartyBotAI::OrderHoldSpot(uint32 mapId, float x, float y, float z)
 {
     SetFollowMode(PB_FOLLOW_LOOSE);
     SetHoldPosition(true);
 
-    // Hold the leader's current spot; ReturnToHoldSpot walks there.
-    m_holdMapId = pLeader->GetMapId();
-    m_holdX = pLeader->GetPositionX();
-    m_holdY = pLeader->GetPositionY();
-    m_holdZ = pLeader->GetPositionZ();
+    m_holdMapId = mapId;
+    m_holdX = x;
+    m_holdY = y;
+    m_holdZ = z;
 }
 
 void PartyBotAI::OrderFollow()
