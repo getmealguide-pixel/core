@@ -3293,15 +3293,15 @@ SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pS
     return result;
 }
 
-void CombatBotBaseAI::AddItemToInventory(uint32 itemId, uint32 count)
+bool CombatBotBaseAI::AddItemToInventory(uint32 itemId, uint32 count)
 {
     ItemPosCountVec dest;
     uint8 msg = me->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, count);
-    if (msg == EQUIP_ERR_OK)
-    {
-        // StoreNewItem already splits the count over the stacks it merges into.
-        me->StoreNewItem(dest, itemId, true, Item::GenerateItemRandomPropertyId(itemId));
-    }
+    if (msg != EQUIP_ERR_OK)
+        return false;
+
+    // StoreNewItem already splits the count over the stacks it merges into.
+    return me->StoreNewItem(dest, itemId, true, Item::GenerateItemRandomPropertyId(itemId)) != nullptr;
 }
 
 // Ammo, quivers and ammo pouches bots may use (user 2026-11-11): any source - vendor, quest,

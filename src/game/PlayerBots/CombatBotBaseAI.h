@@ -135,7 +135,7 @@ public:
     CombatBotRoles GetRole() const;
 
     void EquipOrUseNewItem();
-    void AddItemToInventory(uint32 itemId, uint32 count = 1);
+    bool AddItemToInventory(uint32 itemId, uint32 count = 1); // false: no room (nothing added)
     void AddRangedAmmo(); // allowed arrows/bullets for the equipped bow, gun or crossbow, by level
     void EquipAmmoBag();  // hunters: best allowed quiver/ammo pouch for the ranged weapon and level
     void CheckAmmoBagHaste(); // hunters: quiver/pouch haste aura missing -> re-apply once, log

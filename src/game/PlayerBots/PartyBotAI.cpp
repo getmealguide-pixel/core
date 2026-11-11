@@ -16,6 +16,7 @@
 
 #include "PartyBotAI.h"
 #include "Player.h"
+#include "Bag.h"
 #include "CreatureAI.h"
 #include "MotionMaster.h"
 #include "ObjectMgr.h"
@@ -98,6 +99,62 @@ static void StopEatingDrinking(Player* pPlayer)
         pPlayer->RemoveAurasDueToSpell(entry.food);
         pPlayer->RemoveAurasDueToSpell(entry.drink);
     }
+}
+
+// Task 16c supplies (user 2026-11-11): item of the highest rank whose minimum (level, or First Aid
+// skill for bandages) the bot has. Ids checked against the DB.
+struct PartyBotSupplyRank { uint32 minValue, itemId; };
+static PartyBotSupplyRank const PB_HEALING_POTIONS[] = // Minor .. Major Healing Potion, by level
+    { { 1, 118 }, { 3, 858 }, { 12, 929 }, { 21, 1710 }, { 35, 3928 }, { 45, 13446 } };
+static PartyBotSupplyRank const PB_MANA_POTIONS[] =    // Minor .. Major Mana Potion, by level
+    { { 5, 2455 }, { 14, 3385 }, { 22, 3827 }, { 31, 6149 }, { 41, 13443 }, { 49, 13444 } };
+static PartyBotSupplyRank const PB_BANDAGES[] =        // Linen .. Heavy Runecloth Bandage, by skill
+    { { 1, 1251 }, { 20, 2581 }, { 50, 3530 }, { 75, 3531 }, { 100, 6450 }, { 125, 6451 },
+      { 150, 8544 }, { 175, 8545 }, { 200, 14529 }, { 225, 14530 } };
+
+template <size_t N>
+static uint32 GetBestSupplyRank(PartyBotSupplyRank const (&ranks)[N], uint32 value)
+{
+    uint32 itemId = 0;
+    for (auto const& rank : ranks)
+        if (value >= rank.minValue)
+            itemId = rank.itemId;
+    return itemId;
+}
+
+// Apprentice, Journeyman, Expert, Artisan First Aid (max skill 75, 150, 225, 300).
+static uint32 const PB_FIRST_AID_SPELLS[] = { 3273, 3274, 7924, 10846 };
+#define PB_FIRST_AID_RANK_SKILL 75
+#define PB_SPELL_RECENTLY_BANDAGED 11196
+#define PB_ITEM_BOTTOMLESS_BAG 14156          // 18 slots (no 32-slot bag in 1.12)
+#define PB_POTION_HEALTH_PCT 35.0f            // warrior/rogue/tank: healing potion when attacked below this
+#define PB_MANA_POTION_PCT 50.0f              // mana users: mana potion at or below this
+#define PB_BANDAGE_HEALTH_PCT 50.0f          // tank, melee, ranged: bandage below this
+#define PB_HEALER_BANDAGE_HEALTH_PCT 60.0f    // healer without mana for its cheapest heal: bandage below this
+
+// Best mana restore of an energize spell (mana gem, mana potion), 0 if none.
+static int32 GetMaxManaRestore(SpellEntry const* pSpellEntry)
+{
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (pSpellEntry->Effect[i] == SPELL_EFFECT_ENERGIZE && pSpellEntry->EffectMiscValue[i] == POWER_MANA)
+            return pSpellEntry->EffectBasePoints[i] + pSpellEntry->EffectDieSides[i];
+    return 0;
+}
+
+// The bot's item with this entry in the backpack or a bag.
+static Item* FindInventoryItem(Player const* pPlayer, uint32 itemId)
+{
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (Item* pItem = pPlayer->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            if (pItem->GetEntry() == itemId)
+                return pItem;
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        if (Bag* pBag = dynamic_cast<Bag*>(pPlayer->GetItemByPos(INVENTORY_SLOT_BAG_0, bag)))
+            for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+                if (Item* pItem = pBag->GetItemByPos(slot))
+                    if (pItem->GetEntry() == itemId)
+                        return pItem;
+    return nullptr;
 }
 
 enum PartyBotSpells
@@ -684,10 +741,7 @@ bool PartyBotAI::CrowdControlMarkedTargets()
     for (auto mark : m_marksToCC)
     {
         Unit* pTarget = GetMarkedTarget(mark);
-        if (!pTarget || pTarget->GetObjectGuid() == m_orderedTargetGuid ||
-            m_releasedCC.count(pTarget->GetObjectGuid()) ||
-            pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) ||
-            !IsValidHostileTarget(pTarget) || AreOthersOnSameTarget(pTarget->GetObjectGuid()))
+        if (!pTarget || !IsCCMarkPending(pTarget))
             continue;
 
         SpellEntry const* pSpellEntry = GetCrowdControlSpellFor(pTarget);
@@ -723,6 +777,26 @@ bool PartyBotAI::CrowdControlMarkedTargets()
         if (result == SPELL_FAILED_BAD_TARGETS || result == SPELL_FAILED_IMMUNE || result == SPELL_FAILED_HIGHLEVEL)
             ReleaseCCMark(pTarget, pSpellEntry, result == SPELL_FAILED_HIGHLEVEL ? "level too high" : "not a valid target");
     }
+    return false;
+}
+
+bool PartyBotAI::IsCCMarkPending(Unit const* pTarget) const
+{
+    return pTarget->GetObjectGuid() != m_orderedTargetGuid &&
+          !m_releasedCC.count(pTarget->GetObjectGuid()) &&
+          !pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) &&
+           IsValidHostileTarget(pTarget) && !AreOthersOnSameTarget(pTarget->GetObjectGuid());
+}
+
+bool PartyBotAI::HasPendingCCMark() const
+{
+    if (!HasCrowdControlSpell())
+        return false;
+
+    for (auto mark : m_marksToCC)
+        if (Unit const* pTarget = GetMarkedTarget(mark))
+            if (IsCCMarkPending(pTarget))
+                return true;
     return false;
 }
 
@@ -958,7 +1032,10 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         if (inCombat && !m_wasInCombat)
             WakeUp();
         else if (!inCombat && m_wasInCombat)
+        {
             m_releasedCC.clear(); // fight over: released CC marks count again next pull
+            m_supplyBagFullLogged = false;
+        }
         m_wasInCombat = inCombat;
 
         UpdateForcedAoE();
@@ -1036,7 +1113,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         PopulateSpellData();
         AddAllSpellReagents();
         EquipAmmoBag();
+        FillEmptyBagSlots();
         AddRangedAmmo();
+        UpdateFirstAid();
         me->RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SPAWNING);
         SummonPetIfNeeded();
         me->SetHealthPercent(100.0f);
@@ -1110,6 +1189,10 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (me->IsDead())
     {
+        m_wasDead = true;
+        if (m_bandageSpellId)
+            EndBandage();
+
         if (me->InBattleGround())
         {
             if (me->GetDeathState() == CORPSE)
@@ -1130,6 +1213,16 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
         return;
     }
+
+    if (m_wasDead)
+    {
+        m_wasDead = false;
+        RepairGear("revived");
+    }
+
+    // Survival layer (16c): potions, mana gem, bandages; also ends/stops a running bandage.
+    if (UpdateSurvival())
+        return;
 
     if (me->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
     {
@@ -1409,6 +1502,8 @@ char const* PartyBotAI::GetLayerName(PartyBotLayer layer) const
 {
     switch (layer)
     {
+        case PB_LAYER_SURVIVAL:
+            return "Survival";
         case PB_LAYER_COMMAND:
             return m_holdPosition ? "Command(stay)" : "Command(toggle)";
         case PB_LAYER_ROLE_DUTY:
@@ -1799,9 +1894,9 @@ bool PartyBotAI::UseManaGem()
             continue;
         uint32 const spellId = pItem->GetProto()->Spells[0].SpellId;
         SpellEntry const* pSpellEntry = spellId ? sSpellMgr.GetSpellEntry(spellId) : nullptr;
-        if (!pSpellEntry || !pSpellEntry->HasEffect(SPELL_EFFECT_ENERGIZE))
+        int32 const restore = pSpellEntry ? GetMaxManaRestore(pSpellEntry) : 0;
+        if (!restore)
             continue;
-        int32 const restore = pSpellEntry->EffectBasePoints[0] + pSpellEntry->EffectDieSides[0];
         if (int32(me->GetMaxPower(POWER_MANA) - me->GetPower(POWER_MANA)) < restore ||
             !me->IsSpellReady(pSpellEntry, pItem->GetProto()))
             return false;
@@ -1816,6 +1911,272 @@ bool PartyBotAI::UseManaGem()
         return false;
     }
     return false;
+}
+
+// Task 16c survival layer: every AI update after the death check, before the auto-shot and
+// channel returns. Order: running bandage (stop rules), healing potion, mana (gem, potion),
+// new bandage. Never two at once: nothing is used while a spell is cast or channeled.
+bool PartyBotAI::UpdateSurvival()
+{
+    if (m_bandageSpellId)
+    {
+        Spell const* pChannel = me->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        if (pChannel && pChannel->m_spellInfo->Id == m_bandageSpellId)
+        {
+            char const* stop = nullptr;
+            if (me->GetHealth() >= me->GetMaxHealth())
+                stop = "full health";
+            else if (HasPendingCCMark())
+                stop = "own CC mark needs crowd control";
+            else if (m_holdPosition && !IsOnHoldSpot())
+                stop = "off the hold spot";
+
+            if (!stop)
+                return true;
+
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: stops bandaging (%s, health %.0f%%)",
+                me->GetName(), stop, me->GetHealthPercent());
+            me->InterruptSpell(CURRENT_CHANNELED_SPELL);
+        }
+        else // finished, or broken by the core (damage, moving, item use)
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: bandage over (health %.0f%%)",
+                me->GetName(), me->GetHealthPercent());
+        EndBandage();
+    }
+
+    if (!me->IsInCombat() || IsInDuel() || me->IsNonMeleeSpellCasted(false, false, true))
+        return false;
+
+    // Healing potion: warriors, rogues and tanks only, while hit and low.
+    if (!me->GetAttackers().empty() && me->GetHealthPercent() < PB_POTION_HEALTH_PCT &&
+       (me->GetClass() == CLASS_WARRIOR || me->GetClass() == CLASS_ROGUE || m_role == ROLE_TANK))
+    {
+        if (uint32 const itemId = GetBestSupplyRank(PB_HEALING_POTIONS, me->GetLevel()))
+        {
+            if (UseSupplyItem(itemId, "low health while attacked"))
+            {
+                SetActiveLayer(PB_LAYER_SURVIVAL);
+                return true;
+            }
+        }
+    }
+
+    // Mana users: the mage's own gem first, then a mana potion. Not in Bear/Cat Form (rage/energy:
+    // mana is useless there and the potion cooldown would block a healing potion).
+    if (me->GetPowerType() == POWER_MANA &&
+       ((me->GetClass() == CLASS_MAGE && UseManaGem()) || UseManaPotion()))
+    {
+        SetActiveLayer(PB_LAYER_SURVIVAL);
+        return true;
+    }
+
+    char const* why = "";
+    if (ShouldBandage(why) && StartBandage(why))
+    {
+        SetActiveLayer(PB_LAYER_SURVIVAL);
+        return true;
+    }
+
+    return false;
+}
+
+bool PartyBotAI::UseSupplyItem(uint32 itemId, char const* why)
+{
+    ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(itemId);
+    SpellEntry const* pSpellEntry = pProto ? sSpellMgr.GetSpellEntry(pProto->Spells[0].SpellId) : nullptr;
+    // Cooldown first (potions share 2 min on the bot): no item is added while it runs.
+    if (!pSpellEntry || !me->IsSpellReady(pSpellEntry, pProto))
+        return false;
+
+    Item* pItem = FindInventoryItem(me, itemId);
+    bool const added = !pItem;
+    if (added)
+    {
+        if (!AddItemToInventory(itemId) || !(pItem = FindInventoryItem(me, itemId)))
+        {
+            if (!m_supplyBagFullLogged)
+            {
+                m_supplyBagFullLogged = true;
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: bags full, no %s (%s)", me->GetName(),
+                    pProto->Name1, why);
+            }
+            return false;
+        }
+    }
+
+    float const healthPct = me->GetHealthPercent();
+    float const manaPct = me->GetMaxPower(POWER_MANA) ? me->GetPowerPercent(POWER_MANA) : 0.0f;
+    if (UseItemEffect(pItem)) // the item may be gone now (used up)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: uses %s (%s, health %.0f%%, mana %.0f%%)",
+            me->GetName(), pProto->Name1, why, healthPct, manaPct);
+        return true;
+    }
+
+    if (added)
+        me->DestroyItemCount(itemId, 1, true);
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: could not use %s (%s)%s", me->GetName(),
+        pProto->Name1, why, added ? ", added item removed" : "");
+    return false;
+}
+
+// Mana potion of the bot's level at PB_MANA_POTION_PCT or less (user 2026-11-11: early, so the
+// 2 min cooldown runs before the bot is out of mana).
+bool PartyBotAI::UseManaPotion()
+{
+    uint32 const itemId = GetBestSupplyRank(PB_MANA_POTIONS, me->GetLevel());
+    if (!itemId || me->GetPowerPercent(POWER_MANA) > PB_MANA_POTION_PCT)
+        return false;
+
+    return UseSupplyItem(itemId, "mana");
+}
+
+// Bandage rules (in combat, checked by UpdateSurvival): nobody attacks the bot, no Recently
+// Bandaged, no pull wait, on its spot when holding one, own CC marks handled; then by role.
+bool PartyBotAI::ShouldBandage(char const*& why) const
+{
+    if (!me->GetAttackers().empty() || me->HasAura(PB_SPELL_RECENTLY_BANDAGED) || IsPullWaiting() ||
+       (m_holdPosition && !IsOnHoldSpot()) || HasPendingCCMark())
+        return false;
+
+    // Toggle: the bot moves with the leader, a bandage would break at once.
+    if (!m_holdPosition && m_followMode == PB_FOLLOW_STACKED)
+        if (Player const* pLeader = GetPartyLeader())
+            if (pLeader->IsMoving())
+                return false;
+
+    float const healthPct = me->GetHealthPercent();
+    switch (m_role)
+    {
+        case ROLE_TANK:
+            if (me->GetVictim() || healthPct >= PB_BANDAGE_HEALTH_PCT)
+                return false;
+            why = "tank, no target";
+            return true;
+        case ROLE_HEALER:
+        {
+            if (healthPct >= PB_HEALER_BANDAGE_HEALTH_PCT)
+                return false;
+            uint32 cheapestHeal = UINT32_MAX;
+            for (auto const& pSpellEntry : m_spellListDirectHeal)
+                cheapestHeal = std::min(cheapestHeal, Spell::CalculatePowerCost(pSpellEntry, me, nullptr, nullptr, false));
+            for (auto const& pSpellEntry : m_spellListPeriodicHeal)
+                cheapestHeal = std::min(cheapestHeal, Spell::CalculatePowerCost(pSpellEntry, me, nullptr, nullptr, false));
+            if (cheapestHeal != UINT32_MAX && me->GetPower(POWER_MANA) >= cheapestHeal)
+                return false;
+            why = "healer without mana for a heal";
+            return true;
+        }
+        default:
+            if (healthPct >= PB_BANDAGE_HEALTH_PCT)
+                return false;
+            why = "low health, not attacked";
+            return true;
+    }
+}
+
+// Best bandage for the First Aid skill, used on the bot itself. Standing still first; melee and
+// auto shot stop (own attacks break it), the target is attacked again afterwards.
+bool PartyBotAI::StartBandage(char const* why)
+{
+    uint32 const itemId = GetBestSupplyRank(PB_BANDAGES, me->GetSkillValuePure(SKILL_FIRST_AID));
+    ItemPrototype const* pProto = itemId ? sObjectMgr.GetItemPrototype(itemId) : nullptr;
+    if (!pProto)
+        return false;
+
+    if (me->IsMoving() || me->GetMotionMaster()->GetCurrentMovementGeneratorType() != IDLE_MOTION_TYPE)
+    {
+        me->StopMoving();
+        me->GetMotionMaster()->Clear(false, true);
+        me->GetMotionMaster()->MoveIdle();
+    }
+
+    Unit* pVictim = me->GetVictim();
+    if (!UseSupplyItem(itemId, why))
+        return false;
+
+    m_bandageSpellId = pProto->Spells[0].SpellId;
+    m_bandageTargetGuid = pVictim ? pVictim->GetObjectGuid() : ObjectGuid();
+    if (pVictim)
+        me->AttackStop();
+    if (me->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        me->InterruptSpell(CURRENT_AUTOREPEAT_SPELL, true);
+    return true;
+}
+
+void PartyBotAI::EndBandage()
+{
+    m_bandageSpellId = 0;
+    ObjectGuid const targetGuid = m_bandageTargetGuid;
+    m_bandageTargetGuid.Clear();
+    if (targetGuid.IsEmpty() || !me->IsAlive() || me->GetVictim())
+        return;
+
+    Unit* pTarget = me->GetMap()->GetUnit(targetGuid);
+    if (pTarget && IsValidHostileTarget(pTarget) && !IsForbiddenTarget(pTarget) && AttackStart(pTarget))
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: attacks %s again after bandaging", me->GetName(),
+            pTarget->GetName());
+}
+
+bool PartyBotAI::IsOnHoldSpot() const
+{
+    return me->GetMapId() == m_holdMapId &&
+           me->GetDistance(m_holdX, m_holdY, m_holdZ, SizeFactor::None) <= PB_HOLD_SPOT_TOLERANCE;
+}
+
+// First Aid: the spell ranks up to the skill, skill = level x 5 (max 300). Never lowered.
+// (UpdateSkillsToMaxSkillsForLevel skips professions.)
+void PartyBotAI::UpdateFirstAid()
+{
+    uint16 const skill = uint16(std::min<uint32>(me->GetLevel() * 5, 300));
+    uint16 const maxSkill = ((skill + PB_FIRST_AID_RANK_SKILL - 1) / PB_FIRST_AID_RANK_SKILL) * PB_FIRST_AID_RANK_SKILL;
+    for (uint32 i = 0; i < 4 && PB_FIRST_AID_RANK_SKILL * i < maxSkill; ++i)
+        if (!me->HasSpell(PB_FIRST_AID_SPELLS[i]))
+            me->LearnSpell(PB_FIRST_AID_SPELLS[i], false);
+
+    uint16 const oldSkill = me->GetSkillValuePure(SKILL_FIRST_AID);
+    uint16 const oldMax = me->GetSkillMaxPure(SKILL_FIRST_AID);
+    if (oldSkill >= skill && oldMax >= maxSkill)
+        return;
+
+    uint16 const newSkill = std::max(oldSkill, skill);
+    me->SetSkill(SKILL_FIRST_AID, newSkill, std::max(oldMax, maxSkill));
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: First Aid %u -> %u/%u (bandage %u)", me->GetName(),
+        oldSkill, me->GetSkillValuePure(SKILL_FIRST_AID), me->GetSkillMaxPure(SKILL_FIRST_AID),
+        GetBestSupplyRank(PB_BANDAGES, newSkill));
+}
+
+// Bottomless Bag in every empty bag slot; existing bags stay. Hunters keep one slot free (quiver).
+void PartyBotAI::FillEmptyBagSlots()
+{
+    std::vector<uint8> emptySlots;
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+        if (!me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            emptySlots.push_back(slot);
+    if (me->GetClass() == CLASS_HUNTER && !emptySlots.empty())
+        emptySlots.pop_back();
+
+    uint32 added = 0;
+    for (uint8 slot : emptySlots)
+    {
+        uint16 dest;
+        if (me->CanEquipNewItem(slot, dest, PB_ITEM_BOTTOMLESS_BAG, false) != EQUIP_ERR_OK ||
+            !me->EquipNewItem(dest, PB_ITEM_BOTTOMLESS_BAG, true))
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: cannot equip Bottomless Bag in bag slot %u",
+                me->GetName(), slot);
+            break;
+        }
+        ++added;
+    }
+    if (added)
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: gets %u Bottomless Bag(s)", me->GetName(), added);
+}
+
+void PartyBotAI::RepairGear(char const* why)
+{
+    me->DurabilityRepairAll(false, 0.0f);
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: gear repaired (%s)", me->GetName(), why);
 }
 
 // Checked every world tick unless on stay: following the leader beats eating/drinking, so a
@@ -2099,7 +2460,10 @@ void PartyBotAI::SyncLevelWithLeader(Player const* pLeader)
     PopulateSpellData();
     AddAllSpellReagents();
     EquipAmmoBag();
+    FillEmptyBagSlots();
     AddRangedAmmo();
+    UpdateFirstAid();
+    RepairGear("level up");
     if (me->GetClass() == CLASS_HUNTER)
         MaintainHunterPet();
 
@@ -3507,9 +3871,6 @@ void PartyBotAI::UpdateInCombatAI_Mage()
 {
     if (Unit* pVictim = me->GetVictim())
     {
-        if (UseManaGem())
-            return;
-
         if (m_spells.mage.pCombustion &&
             CanTryToCastSpell(me, m_spells.mage.pCombustion))
         {

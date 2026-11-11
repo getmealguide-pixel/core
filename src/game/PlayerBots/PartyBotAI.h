@@ -27,6 +27,7 @@
 enum PartyBotLayer : uint8
 {
     PB_LAYER_NONE,
+    PB_LAYER_SURVIVAL,  // potions, mana gem, bandages (task 16c)
     PB_LAYER_COMMAND,   // player orders (stay)
     PB_LAYER_ROLE_DUTY, // class/role logic: tank, heal, dps
     PB_LAYER_FOLLOW,    // follow the leader
@@ -100,6 +101,10 @@ public:
     bool DrinkAndEat();
     bool ShouldAutoRevive() const;
     bool CrowdControlMarkedTargets();
+    // A marked enemy that still needs this bot's crowd control (not CC'd, released, ordered or
+    // already attacked by others).
+    bool IsCCMarkPending(Unit const* pTarget) const;
+    bool HasPendingCCMark() const;
     bool EnterCombatDruidForm();
     bool ShouldEnterStealth() const;
     bool EnterStealthIfNeeded(SpellEntry const* pStealthSpell);
@@ -205,6 +210,21 @@ public:
     // Task 16b: mage own mana gem (kept out of combat, used in combat).
     void KeepManaGem();
     bool UseManaGem();
+
+    // Task 16c survival: free potions/bandages on demand, First Aid skill, repair, bags.
+    // Returns true while the survival layer acts (item used, bandaging): nothing else this update.
+    bool UpdateSurvival();
+    // One supply item (potion, bandage): a carried one, else one added for free once its spell is
+    // ready, used at once; a failed use destroys the added item. Full bags: skipped, logged once per fight.
+    bool UseSupplyItem(uint32 itemId, char const* why);
+    bool UseManaPotion();
+    bool ShouldBandage(char const*& why) const;
+    bool StartBandage(char const* why);
+    void EndBandage();
+    bool IsOnHoldSpot() const;
+    void UpdateFirstAid();          // First Aid spell + skill = level x 5 (add, ding)
+    void FillEmptyBagSlots();       // Bottomless Bag in every empty bag slot (add, ding)
+    void RepairGear(char const* why);
     void CommandPetAttack(Unit* pVictim);
 
     bool CheckForDispelTargets();
@@ -252,6 +272,10 @@ public:
     bool m_arrivedAtLeader = false;
     bool m_leaderWasMoving = false;
     bool m_wasInCombat = false;
+    bool m_wasDead = false;                      // revive -> repair
+    bool m_supplyBagFullLogged = false;          // "bags full" logged this fight
+    uint32 m_bandageSpellId = 0;                 // spell of the bandage being channeled, 0 = none
+    ObjectGuid m_bandageTargetGuid;              // enemy attacked before bandaging (re-attacked after)
     bool m_returningToHoldSpot = false;
     uint32 m_returnProgressTime = 0;
     float m_returnBestDistance = 0.0f;
