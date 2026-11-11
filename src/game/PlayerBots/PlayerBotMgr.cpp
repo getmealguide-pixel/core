@@ -2325,7 +2325,7 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
                 {
                     if (pAI->m_role == ROLE_MELEE_DPS || pAI->m_role == ROLE_RANGE_DPS)
                     {
-                        HandlePartyBotPauseApplyHelper(pMember, duration);
+                        pAI->StartPullWait(duration);
                         paused += paused.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
                         continue;
                     }

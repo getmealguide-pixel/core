@@ -105,6 +105,12 @@ public:
     // other marks (and may be a CC mark) until it dies or another order replaces it.
     void OrderAttack(Unit* pTarget);
     void ClearOrderedTarget();
+    // Pull timer for damage dealers: they hold still until it ends; a bot with a CC mark first
+    // walks into range of the marked enemy and crowd-controls it. Any new order ends the wait.
+    void StartPullWait(uint32 duration);
+    void EndPullWait(char const* why);
+    bool IsPullWaiting() const { return m_pullWaitDuration != 0; }
+    void UpdatePullWait();
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
     void OrderStackedFollow(bool stacked);
@@ -217,6 +223,8 @@ public:
     bool m_singleFocus = false;                  // tank only: stays on its preferred target, ignores loose enemies
     ObjectGuid m_orderedTargetGuid;              // target of the last attack/pull order
     uint32 m_moveOrderTime = 0;                  // when the last move order came (for the reaction log)
+    uint32 m_pullWaitStart = 0;                  // pull timer start (ms)
+    uint32 m_pullWaitDuration = 0;               // pull timer length (ms), 0 = not waiting
     bool m_autoAoE = true;                       // damage dealers use area spells on big packs
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
     mutable PartyBotTankSlotMap m_tankSlotCache;

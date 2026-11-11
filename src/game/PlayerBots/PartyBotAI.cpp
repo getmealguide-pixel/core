@@ -806,6 +806,19 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     if (me->IsNonMeleeSpellCasted(false, false, true))
         return;
 
+    if (IsPullWaiting())
+    {
+        if (WorldTimer::getMSTimeDiffToNow(m_pullWaitStart) >= m_pullWaitDuration)
+            EndPullWait("pull timer over");
+        else if (!me->GetAttackers().empty())
+            EndPullWait("attacked");
+        else
+        {
+            UpdatePullWait();
+            return;
+        }
+    }
+
     if (me->GetTargetGuid() == me->GetObjectGuid())
         me->ClearTarget();
 
@@ -1068,6 +1081,7 @@ void PartyBotAI::OrderAttack(Unit* pTarget)
         SetHoldPosition(false);
     }
 
+    EndPullWait("attack order");
     m_orderedTargetGuid = pTarget->GetObjectGuid();
     if (me->GetVictim() && me->GetVictim() != pTarget)
         me->AttackStop(true);
@@ -1079,6 +1093,70 @@ void PartyBotAI::ClearOrderedTarget()
     m_orderedTargetGuid.Clear();
 }
 
+void PartyBotAI::StartPullWait(uint32 duration)
+{
+    m_pullWaitStart = WorldTimer::getMSTime();
+    m_pullWaitDuration = duration;
+    me->StopMoving();
+    me->GetMotionMaster()->Clear(false, true);
+    me->GetMotionMaster()->MoveIdle();
+}
+
+void PartyBotAI::EndPullWait(char const* why)
+{
+    if (!IsPullWaiting())
+        return;
+
+    m_pullWaitDuration = 0;
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: stops waiting (%s)", me->GetName(), why);
+}
+
+// While the pull timer runs: crowd-control the CC marks given to this bot (walking into spell
+// range and line of sight first, also off a stay spot), otherwise stand still.
+void PartyBotAI::UpdatePullWait()
+{
+    SpellEntry const* pSpellEntry = GetCrowdControlSpell();
+    for (auto mark : m_marksToCC)
+    {
+        Unit* pTarget = pSpellEntry ? GetMarkedTarget(mark) : nullptr;
+        if (!pTarget || !IsValidHostileTarget(pTarget) ||
+            pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+            continue;
+
+        float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
+        if (!me->IsWithinDistInMap(pTarget, range - 2.0f) || !me->IsWithinLOSInMap(pTarget))
+        {
+            if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+            {
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: moves into %s range of %s (CC mark)",
+                    me->GetName(), pSpellEntry->SpellName[0].c_str(), pTarget->GetName());
+                if (m_holdPosition)
+                    SetHoldPosition(false);
+                me->GetMotionMaster()->MoveChase(pTarget, range * 0.6f);
+            }
+            return;
+        }
+
+        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
+        {
+            me->StopMoving();
+            me->GetMotionMaster()->Clear(false, true);
+            me->GetMotionMaster()->MoveIdle();
+        }
+
+        if (CanTryToCastSpell(pTarget, pSpellEntry))
+            DoCastSpell(pTarget, pSpellEntry);
+        return;
+    }
+
+    if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != IDLE_MOTION_TYPE)
+    {
+        me->StopMoving();
+        me->GetMotionMaster()->Clear(false, true);
+        me->GetMotionMaster()->MoveIdle();
+    }
+}
+
 // Hold a given spot (comestay: the leader's position; aedm "move here": the clicked ground);
 // ReturnToHoldSpot walks there and keeps the bot there like stay. The order wins at once over
 // whatever the bot is doing: casts, eating/drinking, attacks and attack orders are dropped.
@@ -1086,6 +1164,7 @@ void PartyBotAI::OrderHoldSpot(uint32 mapId, float x, float y, float z)
 {
     BreakCurrentActions();
     ClearOrderedTarget();
+    EndPullWait("move order");
     if (me->GetVictim())
         me->AttackStop(true);
     m_moveOrderTime = WorldTimer::getMSTime();
@@ -1102,6 +1181,7 @@ void PartyBotAI::OrderHoldSpot(uint32 mapId, float x, float y, float z)
 void PartyBotAI::OrderFollow()
 {
     ClearOrderedTarget();
+    EndPullWait("follow order");
     SetHoldPosition(false);
     SetFollowMode(PB_FOLLOW_ARRIVE);
     BreakActionsAndFollowNow();
@@ -1110,6 +1190,7 @@ void PartyBotAI::OrderFollow()
 void PartyBotAI::OrderStackedFollow(bool stacked)
 {
     ClearOrderedTarget();
+    EndPullWait("toggle order");
     SetHoldPosition(false);
     SetFollowMode(stacked ? PB_FOLLOW_STACKED : PB_FOLLOW_LOOSE);
     if (stacked)
@@ -1240,8 +1321,9 @@ void PartyBotAI::ReactToLeaderMovement()
     bool const startedMoving = leaderMoving && !m_leaderWasMoving;
     m_leaderWasMoving = leaderMoving;
 
-    // Not while paused (an active pause keeps the update timer longer than one interval).
-    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > GetUpdateInterval())
+    // Not while paused (an active pause keeps the update timer longer than one interval) or
+    // waiting for a pull timer.
+    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > GetUpdateInterval() || IsPullWaiting())
         return;
 
     if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
@@ -1263,8 +1345,9 @@ void PartyBotAI::StandUpToFollow()
     if (!isEating && !isDrinking)
         return;
 
-    // Not while paused (an active pause keeps the update timer longer than one interval).
-    if (m_updateTimer.GetExpiry() > GetUpdateInterval())
+    // Not while paused (an active pause keeps the update timer longer than one interval) or
+    // waiting for a pull timer.
+    if (m_updateTimer.GetExpiry() > GetUpdateInterval() || IsPullWaiting())
         return;
 
     Player* pLeader = GetPartyLeader();
