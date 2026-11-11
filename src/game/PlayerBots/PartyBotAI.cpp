@@ -53,10 +53,55 @@ static Unit const* GetAreaCenter(Unit const* pCaster, Unit const* pTarget, Spell
     return pSpellEntry->rangeIndex == SPELL_RANGE_IDX_SELF_ONLY ? pCaster : pTarget;
 }
 
+// Free eating/drinking: the effect of vendor food/drink for the bot's level (minimum level of the
+// food, food spell, drink spell). Was one fixed level-45 effect for every level.
+static struct { uint32 minLevel, food, drink; } const PB_FOOD_DRINK[] =
+{
+    {  1,   433,   430 },
+    {  5,   434,   431 },
+    { 15,   435,   432 },
+    { 25,  1127,  1133 },
+    { 35,  1129,  1135 },
+    { 45,  1131,  1137 },
+    { 55, 29073, 22734 }, // Conjured Cinnamon Roll / Conjured Crystal Water
+};
+
+static uint32 GetFoodSpellId(Player const* pPlayer, bool drink)
+{
+    uint32 spellId = 0;
+    for (auto const& entry : PB_FOOD_DRINK)
+        if (pPlayer->GetLevel() >= entry.minLevel)
+            spellId = drink ? entry.drink : entry.food;
+    return spellId;
+}
+
+static bool IsEating(Player const* pPlayer)
+{
+    for (auto const& entry : PB_FOOD_DRINK)
+        if (pPlayer->HasAura(entry.food))
+            return true;
+    return false;
+}
+
+static bool IsDrinking(Player const* pPlayer)
+{
+    for (auto const& entry : PB_FOOD_DRINK)
+        if (pPlayer->HasAura(entry.drink))
+            return true;
+    return false;
+}
+
+static void StopEatingDrinking(Player* pPlayer)
+{
+    for (auto const& entry : PB_FOOD_DRINK)
+    {
+        pPlayer->RemoveAurasDueToSpell(entry.food);
+        pPlayer->RemoveAurasDueToSpell(entry.drink);
+    }
+}
+
 enum PartyBotSpells
 {
-    PB_SPELL_FOOD = 1131,
-    PB_SPELL_DRINK = 1137,
     PB_SPELL_AUTO_SHOT = 75,
     PB_SPELL_SHOOT_WAND = 5019,
     PB_SPELL_SHOOT_BOW = 2480,
@@ -178,8 +223,8 @@ bool PartyBotAI::DrinkAndEat()
         return false;
 
     // Like a player: sit down only when clearly low; once sitting, eat/drink up to full.
-    bool const isEating = me->HasAura(PB_SPELL_FOOD);
-    bool const isDrinking = me->HasAura(PB_SPELL_DRINK);
+    bool const isEating = IsEating(me);
+    bool const isDrinking = IsDrinking(me);
     bool const isSitting = isEating || isDrinking;
     float const healthPct = me->GetHealthPercent();
     float const manaPct = me->GetPowerType() == POWER_MANA ? me->GetPowerPercent(POWER_MANA) : 100.0f;
@@ -191,8 +236,9 @@ bool PartyBotAI::DrinkAndEat()
         return false;
 
     if (!isSitting)
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: sits down to %s (health %.0f%%, mana %.0f%%)",
-            me->GetName(), needToDrink ? (needToEat ? "eat and drink" : "drink") : "eat", healthPct, manaPct);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: sits down to %s (health %.0f%%, mana %.0f%%, food %u, drink %u)",
+            me->GetName(), needToDrink ? (needToEat ? "eat and drink" : "drink") : "eat", healthPct, manaPct,
+            GetFoodSpellId(me, false), GetFoodSpellId(me, true));
 
     if (!isEating && needToEat)
     {
@@ -202,7 +248,7 @@ bool PartyBotAI::DrinkAndEat()
             me->GetMotionMaster()->Clear(false, true);
             me->GetMotionMaster()->MoveIdle();
         }
-        if (SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(PB_SPELL_FOOD))
+        if (SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(GetFoodSpellId(me, false)))
         {
             me->CastSpell(me, pSpellEntry, true);
             me->RemoveSpellCooldown(pSpellEntry);
@@ -218,7 +264,7 @@ bool PartyBotAI::DrinkAndEat()
             me->GetMotionMaster()->Clear(false, true);
             me->GetMotionMaster()->MoveIdle();
         }
-        if (SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(PB_SPELL_DRINK))
+        if (SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(GetFoodSpellId(me, true)))
         {
             me->CastSpell(me, pSpellEntry, true);
             me->RemoveSpellCooldown(pSpellEntry);
@@ -898,6 +944,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         m_wasInCombat = inCombat;
 
         UpdateForcedAoE();
+
+        CheckAmmoBagHaste();
     }
 
     m_updateTimer.Update(diff);
@@ -969,6 +1017,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         ResetSpellData();
         PopulateSpellData();
         AddAllSpellReagents();
+        EquipAmmoBag();
+        AddRangedAmmo();
         me->RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SPAWNING);
         SummonPetIfNeeded();
         me->SetHealthPercent(100.0f);
@@ -1132,10 +1182,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (!me->IsInCombat())
     {
-        if (groupFighting && (me->HasAura(PB_SPELL_FOOD) || me->HasAura(PB_SPELL_DRINK)))
+        if (groupFighting && (IsEating(me) || IsDrinking(me)))
         {
-            me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
-            me->RemoveAurasDueToSpell(PB_SPELL_DRINK);
+            StopEatingDrinking(me);
             if (me->GetStandState() != UNIT_STAND_STATE_STAND)
                 me->SetStandState(UNIT_STAND_STATE_STAND);
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: stops eating/drinking, the group is fighting",
@@ -1573,12 +1622,11 @@ void PartyBotAI::BreakCurrentActions()
     if (pSpell)
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Order] %s: stops casting %s for the order", me->GetName(),
             pSpell->m_spellInfo->SpellName[0].c_str());
-    if (me->HasAura(PB_SPELL_FOOD) || me->HasAura(PB_SPELL_DRINK))
+    if (IsEating(me) || IsDrinking(me))
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Order] %s: stops eating/drinking for the order", me->GetName());
 
     me->InterruptNonMeleeSpells(false);
-    me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
-    me->RemoveAurasDueToSpell(PB_SPELL_DRINK);
+    StopEatingDrinking(me);
     if (me->GetStandState() != UNIT_STAND_STATE_STAND)
         me->SetStandState(UNIT_STAND_STATE_STAND);
     m_isBuffing = false;
@@ -1706,8 +1754,8 @@ void PartyBotAI::ReactToLeaderMovement()
 // sitting bot stands up the moment the leader moves (and follows on the next tick).
 void PartyBotAI::StandUpToFollow()
 {
-    bool const isEating = me->HasAura(PB_SPELL_FOOD);
-    bool const isDrinking = me->HasAura(PB_SPELL_DRINK);
+    bool const isEating = IsEating(me);
+    bool const isDrinking = IsDrinking(me);
     if (!isEating && !isDrinking)
         return;
 
@@ -1720,8 +1768,7 @@ void PartyBotAI::StandUpToFollow()
     if (!pLeader || !pLeader->IsInWorld() || !pLeader->IsMoving())
         return;
 
-    me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
-    me->RemoveAurasDueToSpell(PB_SPELL_DRINK);
+    StopEatingDrinking(me);
     if (me->GetStandState() != UNIT_STAND_STATE_STAND)
         me->SetStandState(UNIT_STAND_STATE_STAND);
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: stops %s to follow", me->GetName(),
@@ -1983,6 +2030,8 @@ void PartyBotAI::SyncLevelWithLeader(Player const* pLeader)
     ResetSpellData();
     PopulateSpellData();
     AddAllSpellReagents();
+    EquipAmmoBag();
+    AddRangedAmmo();
     if (me->GetClass() == CLASS_HUNTER)
         MaintainHunterPet();
 

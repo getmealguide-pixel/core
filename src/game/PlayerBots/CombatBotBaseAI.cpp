@@ -2,6 +2,7 @@
 #include "CombatBotBaseAI.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "Bag.h"
 #include "Group.h"
 #include "PlayerBotMgr.h"
 #include "Opcodes.h"
@@ -13,6 +14,7 @@
 #include "Utilities/Random.h"
 
 #include <random>
+#include <unordered_set>
 
 enum CombatBotSpells
 {
@@ -1844,17 +1846,43 @@ void CombatBotBaseAI::AddAllSpellReagents()
     for (const auto& pSpell : m_spells.raw.spells)
     {
         if (pSpell)
+            EnsureSpellReagents(pSpell);
+    }
+}
+
+// Supplies are free: before a cast (and on add/ding) the bot gets what the spell needs - every
+// reagent up to a full stack (at least the spell's count) and each required totem item.
+void CombatBotBaseAI::EnsureSpellReagents(SpellEntry const* pSpellEntry)
+{
+    for (uint32 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+    {
+        if (pSpellEntry->Reagent[i] <= 0)
+            continue;
+
+        uint32 const itemId = pSpellEntry->Reagent[i];
+        uint32 const need = std::max<uint32>(1, pSpellEntry->ReagentCount[i]);
+        uint32 const have = me->GetItemCount(itemId);
+        if (have >= need)
+            continue;
+
+        ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(itemId);
+        if (!pProto)
+            continue;
+
+        uint32 const target = std::max<uint32>(need, pProto->GetMaxStackSize());
+        AddItemToInventory(itemId, target - have);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: gets %u %s for %s (had %u)", me->GetName(),
+            target - have, pProto->Name1, pSpellEntry->SpellName[0].c_str(), have);
+    }
+
+    for (auto const& totem : pSpellEntry->Totem)
+    {
+        if (totem && !me->HasItemCount(totem, 1))
         {
-            for (const auto& reagent : pSpell->Reagent)
-            {
-                if (reagent && !me->HasItemCount(reagent, 1))
-                    AddItemToInventory(reagent);
-            }
-            for (const auto& totem : pSpell->Totem)
-            {
-                if (totem && !me->HasItemCount(totem, 1))
-                    AddItemToInventory(totem);
-            }
+            AddItemToInventory(totem);
+            if (ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(totem))
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: gets %s for %s", me->GetName(),
+                    pProto->Name1, pSpellEntry->SpellName[0].c_str());
         }
     }
 }
@@ -3248,6 +3276,7 @@ SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pS
         me->RemoveSpellsCausingAura(SPELL_AURA_MOUNTED);
 
     me->SetTargetGuid(pTarget->GetObjectGuid());
+    EnsureSpellReagents(pSpellEntry);
     auto result = me->CastSpell(pTarget, pSpellEntry, false);
 
     if (result == SPELL_CAST_OK)
@@ -3260,16 +3289,6 @@ SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pS
         (me->IsMoving() || !me->IsStopped()))
         me->StopMoving();
 
-    if ((result == SPELL_FAILED_NEED_AMMO_POUCH ||
-        result == SPELL_FAILED_ITEM_NOT_READY) &&
-        pSpellEntry->Reagent[0])
-    {
-        if (Item* pItem = me->GetItemByPos(INVENTORY_SLOT_BAG_0, INVENTORY_SLOT_ITEM_START))
-            me->DestroyItem(INVENTORY_SLOT_BAG_0, INVENTORY_SLOT_ITEM_START, true);
-
-        AddItemToInventory(pSpellEntry->Reagent[0]);
-    }
-
     return result;
 }
 
@@ -3279,63 +3298,213 @@ void CombatBotBaseAI::AddItemToInventory(uint32 itemId, uint32 count)
     uint8 msg = me->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, count);
     if (msg == EQUIP_ERR_OK)
     {
-        if (Item* pItem = me->StoreNewItem(dest, itemId, true, Item::GenerateItemRandomPropertyId(itemId)))
-            pItem->SetCount(count);
+        // StoreNewItem already splits the count over the stacks it merges into.
+        me->StoreNewItem(dest, itemId, true, Item::GenerateItemRandomPropertyId(itemId));
     }
 }
 
+// Ammo, quivers and ammo pouches bots may use (user 2026-11-11): any source - vendor, quest,
+// crafted, dungeon or world drop - but never raid loot, epics, test/deprecated/monster items,
+// items nothing gives, or Alliance-only quest rewards (bots are Horde). Checked against the DB.
+// On an item-level tie the earlier entry wins (Hunting Quiver before Medium Quiver).
+static uint32 const PB_ALLOWED_ARROWS[] = { 2512, 2515, 3030, 9399, 10579, 11285, 19316, 18042, 12654 };
+static uint32 const PB_ALLOWED_BULLETS[] = { 2516, 8067, 2519, 5568, 8068, 3033, 8069, 3034, 10512, 11284,
+    10513, 11630, 19317, 15997, 13377 };
+static uint32 const PB_ALLOWED_QUIVERS[] = { 2101, 5439, 7278, 3573, 11362, 7371, 8217, 2662, 19319 };
+static uint32 const PB_ALLOWED_POUCHES[] = { 5441, 7279, 3574, 7372, 8218, 2663, 19320 };
+
+// Usable at this level: the required level, or for items without one, 5 below the item level.
+static bool IsSupplyLevelOk(ItemPrototype const* pProto, uint32 level)
+{
+    if (pProto->RequiredLevel)
+        return pProto->RequiredLevel <= level;
+    return pProto->ItemLevel <= level + 5;
+}
+
+// Ammo type (arrow/bullet) the equipped ranged weapon fires, 0 = none (wand, thrown, no weapon).
+static uint32 GetRangedAmmoType(Player const* pPlayer)
+{
+    Item* pWeapon = pPlayer->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    if (!pWeapon || pWeapon->GetProto()->Class != ITEM_CLASS_WEAPON)
+        return 0;
+
+    switch (pWeapon->GetProto()->SubClass)
+    {
+        case ITEM_SUBCLASS_WEAPON_GUN:
+            return ITEM_SUBCLASS_BULLET;
+        case ITEM_SUBCLASS_WEAPON_BOW:
+        case ITEM_SUBCLASS_WEAPON_CROSSBOW:
+            return ITEM_SUBCLASS_ARROW;
+    }
+    return 0;
+}
+
+// Free ammo: the best allowed arrows/bullets for the bot's level (highest item level), topped
+// up to a full stack. Ammo of other kinds (older level, other weapon) is removed; nothing else.
 void CombatBotBaseAI::AddRangedAmmo()
 {
-    if (Item* pWeapon = me->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED))
+    uint32 const ammoType = GetRangedAmmoType(me);
+    if (!ammoType)
+        return;
+
+    ItemPrototype const* pAmmoProto = nullptr;
+    auto pickAmmo = [&](uint32 itemId)
     {
-        if (ItemPrototype const* pWeaponProto = pWeapon->GetProto())
-        {
-            if (pWeaponProto->Class == ITEM_CLASS_WEAPON)
-            {
-                uint32 ammoType;
-                switch (pWeaponProto->SubClass)
-                {
-                    case ITEM_SUBCLASS_WEAPON_GUN:
-                        ammoType = ITEM_SUBCLASS_BULLET;
-                        break;
-                    case ITEM_SUBCLASS_WEAPON_BOW:
-                    case ITEM_SUBCLASS_WEAPON_CROSSBOW:
-                        ammoType = ITEM_SUBCLASS_ARROW;
-                        break;
-                    default:
-                        return;
-                }
+        ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(itemId);
+        if (pProto && IsSupplyLevelOk(pProto, me->GetLevel()) &&
+            (!pAmmoProto || pAmmoProto->ItemLevel < pProto->ItemLevel) &&
+            me->CanUseAmmo(itemId) == EQUIP_ERR_OK)
+            pAmmoProto = pProto;
+    };
+    if (ammoType == ITEM_SUBCLASS_BULLET)
+        for (uint32 itemId : PB_ALLOWED_BULLETS)
+            pickAmmo(itemId);
+    else
+        for (uint32 itemId : PB_ALLOWED_ARROWS)
+            pickAmmo(itemId);
 
-                ItemPrototype const* pAmmoProto = nullptr;
-                for (auto const& itr : sObjectMgr.GetItemPrototypeMap())
-                {
-                    ItemPrototype const* pProto = &itr.second;
+    if (!pAmmoProto)
+        return;
 
-                    if (pProto->Class == ITEM_CLASS_PROJECTILE &&
-                        pProto->SubClass == ammoType &&
-                        pProto->RequiredLevel <= me->GetLevel() &&
-                        (!pAmmoProto || pAmmoProto->ItemLevel < pProto->ItemLevel) &&
-                        me->CanUseAmmo(pProto->ItemId) == EQUIP_ERR_OK)
-                    {
-                        pAmmoProto = pProto;
-                    }
-                }
+    // Remove other ammo (backpack and bags, incl. quiver/pouch).
+    auto destroyOtherAmmo = [this, pAmmoProto](uint8 bag, uint8 slot)
+    {
+        Item* pItem = me->GetItemByPos(bag, slot);
+        if (pItem && pItem->GetProto()->Class == ITEM_CLASS_PROJECTILE && pItem->GetEntry() != pAmmoProto->ItemId)
+            me->DestroyItem(bag, slot, true);
+    };
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        destroyOtherAmmo(INVENTORY_SLOT_BAG_0, slot);
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        if (Bag* pBag = dynamic_cast<Bag*>(me->GetItemByPos(INVENTORY_SLOT_BAG_0, bag)))
+            for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+                destroyOtherAmmo(bag, slot);
 
-                if (pAmmoProto)
-                {
-                    if (Item* pItem = me->GetItemByPos(INVENTORY_SLOT_BAG_0, INVENTORY_SLOT_ITEM_START))
-                        me->DestroyItem(INVENTORY_SLOT_BAG_0, INVENTORY_SLOT_ITEM_START, true);
-
-                    AddItemToInventory(pAmmoProto->ItemId, pAmmoProto->GetMaxStackSize());
-                    me->SetAmmo(pAmmoProto->ItemId);
-                }
-            }
-        }
+    uint32 const have = me->GetItemCount(pAmmoProto->ItemId);
+    uint32 const stack = pAmmoProto->GetMaxStackSize();
+    if (have < stack)
+    {
+        AddItemToInventory(pAmmoProto->ItemId, stack - have);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: gets %u %s (had %u)", me->GetName(),
+            stack - have, pAmmoProto->Name1, have);
     }
+    me->SetAmmo(pAmmoProto->ItemId);
+}
+
+// Hunters: the best allowed quiver (bow/crossbow) or ammo pouch (gun) for the level, in a bag
+// slot (ranged attack speed bonus). A different quiver/pouch is replaced; ammo is refilled after.
+void CombatBotBaseAI::EquipAmmoBag()
+{
+    if (me->GetClass() != CLASS_HUNTER)
+        return;
+
+    uint32 const ammoType = GetRangedAmmoType(me);
+    if (!ammoType)
+        return;
+    uint32 const bagType = ammoType == ITEM_SUBCLASS_BULLET ? ITEM_SUBCLASS_AMMO_POUCH : ITEM_SUBCLASS_QUIVER;
+
+    ItemPrototype const* pBagProto = nullptr;
+    auto pickBag = [&](uint32 itemId)
+    {
+        ItemPrototype const* pProto = sObjectMgr.GetItemPrototype(itemId);
+        if (pProto && IsSupplyLevelOk(pProto, me->GetLevel()) &&
+            (!pBagProto || pBagProto->ItemLevel < pProto->ItemLevel ||
+             (pBagProto->ItemLevel == pProto->ItemLevel && pBagProto->ContainerSlots < pProto->ContainerSlots)))
+            pBagProto = pProto;
+    };
+    if (bagType == ITEM_SUBCLASS_AMMO_POUCH)
+        for (uint32 itemId : PB_ALLOWED_POUCHES)
+            pickBag(itemId);
+    else
+        for (uint32 itemId : PB_ALLOWED_QUIVERS)
+            pickBag(itemId);
+    if (!pBagProto)
+        return;
+
+    // Already carried? Otherwise remove the old quiver/pouch (only ammo inside, refilled after).
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+    {
+        Item* pBag = me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!pBag || pBag->GetProto()->Class != ITEM_CLASS_QUIVER)
+            continue;
+        if (pBag->GetEntry() == pBagProto->ItemId)
+            return;
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: removes %s", me->GetName(), pBag->GetProto()->Name1);
+        me->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+    }
+
+    uint8 const slot = me->FindEquipSlot(pBagProto, NULL_SLOT, false);
+    uint16 dest;
+    if (slot == NULL_SLOT || me->CanEquipNewItem(slot, dest, pBagProto->ItemId, false) != EQUIP_ERR_OK ||
+        !me->EquipNewItem(dest, pBagProto->ItemId, true))
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: cannot equip %s (no free bag slot)", me->GetName(),
+            pBagProto->Name1);
+        return;
+    }
+
+    uint32 const hasteSpell = pBagProto->Spells[0].SpellId;
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: equips %s (%u slots, haste aura %u %s)", me->GetName(),
+        pBagProto->Name1, pBagProto->ContainerSlots, hasteSpell,
+        hasteSpell && me->HasAura(hasteSpell) ? "active" : "MISSING");
+}
+
+// The quiver/pouch haste aura can be missing right after equipping (seen on bot add). Re-apply
+// the item's equip spell once and log the result; tried again only after the aura was seen.
+void CombatBotBaseAI::CheckAmmoBagHaste()
+{
+    if (me->GetClass() != CLASS_HUNTER || !me->IsAlive())
+        return;
+
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+    {
+        Item* pBag = me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!pBag || pBag->GetProto()->Class != ITEM_CLASS_QUIVER)
+            continue;
+
+        uint32 const hasteSpell = pBag->GetProto()->Spells[0].SpellId;
+        if (!hasteSpell || me->HasAura(hasteSpell))
+        {
+            m_ammoBagHasteRetried = false;
+            return;
+        }
+        if (m_ammoBagHasteRetried)
+            return;
+
+        m_ammoBagHasteRetried = true;
+        me->ApplyItemEquipSpell(pBag, false);
+        me->ApplyItemEquipSpell(pBag, true);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: haste aura %u of %s was missing, re-applied: %s",
+            me->GetName(), hasteSpell, pBag->GetProto()->Name1, me->HasAura(hasteSpell) ? "active" : "STILL MISSING");
+        return;
+    }
+}
+
+#define PB_TRADE_BUFF_MIN_DURATION (10 * MINUTE * IN_MILLISECONDS)
+
+// On-use spell of a traded consumable that the bot uses at once: a long buff (elixir, flask,
+// scroll, protection potion; >= 10 min). Heals, mana, food/drink, bandages and short buffs are kept.
+static SpellEntry const* GetTradeBuffSpell(ItemPrototype const* pProto)
+{
+    for (auto const& itr : pProto->Spells)
+    {
+        if (!itr.SpellId || itr.SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+            continue;
+        SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(itr.SpellId);
+        if (!pSpellEntry || !pSpellEntry->IsSpellAppliesAura() ||
+            pSpellEntry->HasEffect(SPELL_EFFECT_HEAL) || pSpellEntry->HasEffect(SPELL_EFFECT_ENERGIZE) ||
+            pSpellEntry->HasAura(SPELL_AURA_PERIODIC_HEAL) || pSpellEntry->HasAura(SPELL_AURA_PERIODIC_ENERGIZE) ||
+            pSpellEntry->HasAura(SPELL_AURA_MOD_REGEN) || pSpellEntry->HasAura(SPELL_AURA_MOD_POWER_REGEN) ||
+            pSpellEntry->GetDuration() < PB_TRADE_BUFF_MIN_DURATION)
+            return nullptr;
+        return pSpellEntry;
+    }
+    return nullptr;
 }
 
 void CombatBotBaseAI::EquipOrUseNewItem()
 {
+    std::unordered_set<uint32> usedSpells; // one of each buff per trade
     for (int i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
     {
         Item* pItem = me->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
@@ -3345,8 +3514,18 @@ void CombatBotBaseAI::EquipOrUseNewItem()
             {
                 case ITEM_CLASS_CONSUMABLE:
                 {
+                    // Was: every consumable in the backpack used at once (potions wasted at full health).
+                    SpellEntry const* pBuff = GetTradeBuffSpell(pItem->GetProto());
+                    if (!pBuff || me->HasAura(pBuff->Id) || !usedSpells.insert(pBuff->Id).second)
+                    {
+                        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: keeps %u %s in the bag", me->GetName(),
+                            pItem->GetCount(), pItem->GetProto()->Name1);
+                        break;
+                    }
                     SpellCastTargets targets;
                     targets.setUnitTarget(me);
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: uses traded %s", me->GetName(),
+                        pItem->GetProto()->Name1);
                     me->CastItemUseSpell(pItem, targets);
                     break;
                 }

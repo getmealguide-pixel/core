@@ -136,7 +136,11 @@ public:
 
     void EquipOrUseNewItem();
     void AddItemToInventory(uint32 itemId, uint32 count = 1);
-    void AddRangedAmmo(); // arrows/bullets for the equipped bow, gun or crossbow
+    void AddRangedAmmo(); // allowed arrows/bullets for the equipped bow, gun or crossbow, by level
+    void EquipAmmoBag();  // hunters: best allowed quiver/ammo pouch for the ranged weapon and level
+    void CheckAmmoBagHaste(); // hunters: quiver/pouch haste aura missing -> re-apply once, log
+    bool m_ammoBagHasteRetried = false;
+    void EnsureSpellReagents(SpellEntry const* pSpellEntry); // free reagents/totems, before the cast
     uint8 GetHighestHonorRankFromEquippedItems() const;
     void UpdateVisualHonorRankBasedOnItems();
     void BeginChasing(Unit* pVictim) const;
