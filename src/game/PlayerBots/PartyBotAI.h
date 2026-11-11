@@ -40,6 +40,14 @@ enum PartyBotFollowMode : uint8
     PB_FOLLOW_STACKED, // "toggle": stay stacked on the leader all the time
 };
 
+// Area spells of damage dealers (.partybot aoe auto|on|off).
+enum PartyBotAoEMode : uint8
+{
+    PB_AOE_AUTO,   // packs of PartyBot.AutoAoE.MinTargets+, never near crowd control
+    PB_AOE_FORCED, // "on": any pack size, also near crowd control; back to auto after the fight
+    PB_AOE_OFF,    // no damaging area spells
+};
+
 // Tank slots: main tank and numbered off-tanks. Everyone else has PB_TANK_SLOT_NONE.
 enum PartyBotTankSlot : uint8
 {
@@ -172,9 +180,15 @@ public:
     bool LearnRoleSpecTalents();
     uint32 GetMainTalentTab() const;
 
-    // Casts the first usable hostile area spell at the target. forced (.partybot aoe): no
-    // usability checks and interrupts a non-area cast; otherwise the normal casting rules apply.
-    bool CastAreaOfEffectSpell(Unit* pTarget, bool forced);
+    // Area spells. Damage area spells only (no fears, roots, shouts or taunts); the first one in
+    // range that the casting rules allow is cast at the target (ground spells land on its spot).
+    static bool IsDamageAreaSpell(SpellEntry const* pSpellEntry);
+    bool CastAreaOfEffectSpell(Unit* pTarget);
+    // A living enemy with any bot's CC mark within PB_AOE_CC_MARK_RANGE of this bot.
+    Unit* GetCCMarkedEnemyNearby() const;
+    void SetAoEMode(PartyBotAoEMode mode, char const* why);
+    void EndForcedAoE(char const* why);
+    void UpdateForcedAoE();
 
     void MaintainHunterPet();
     void CommandPetAttack(Unit* pVictim);
@@ -241,7 +255,8 @@ public:
     uint32 m_rangedPullStart = 0;                // when the rpull order came
     uint32 m_rangedPullShotTime = 0;             // when the rpull shot left, 0 = not yet
     bool m_orderOverridesCC = false;             // attack order (not pull) may hit a CC mark
-    bool m_autoAoE = true;                       // damage dealers use area spells on big packs
+    PartyBotAoEMode m_aoeMode = PB_AOE_AUTO;     // damage dealers' area spells
+    bool m_forcedAoEFought = false;              // forced AoE: the bot has fought since it was set
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
     mutable PartyBotTankSlotMap m_tankSlotCache;
     mutable uint32 m_tankSlotCacheTime = 0;

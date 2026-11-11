@@ -3220,6 +3220,11 @@ AHBot.itemcount = 50
 #        always wake a bot on the next world tick.
 #        Default: 500 (min 100, max 1000)
 #
+#    PartyBot.AutoAoE.MinTargets
+#        Damage dealer bots in "aoe auto" mode use area spells when at least this many enemies
+#        (their target included) stand within 10 yards of their target.
+#        Default: 3 (min 1, max 20)
+#
 #    BattleBot.AutoEquip
 #        What gear will new battlebots spawn with.
 #        Default: 1 (random items)
@@ -3248,6 +3253,7 @@ PartyBot.SkipChecks = 0
 PartyBot.AutoEquip = 1
 PartyBot.RandomGearLevelDifference = 10
 PartyBot.UpdateInterval = 500
+PartyBot.AutoAoE.MinTargets = 3
 
 BattleBot.AutoEquip = 1
 BattleBot.AutoJoin = 0

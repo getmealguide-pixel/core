@@ -37,6 +37,22 @@ static uint32 GetUpdateInterval()
     return sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_UPDATE_INTERVAL);
 }
 
+// Radius of an area spell (first effect that has one; 10 yd if none).
+static float GetAreaRadius(SpellEntry const* pSpellEntry)
+{
+    for (auto radiusIndex : pSpellEntry->EffectRadiusIndex)
+        if (radiusIndex)
+            return Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(radiusIndex));
+    return 10.0f;
+}
+
+// Self-centred spells (Arcane Explosion, Whirlwind) hit around the caster, others around the target
+// (ground spells land on the target's position).
+static Unit const* GetAreaCenter(Unit const* pCaster, Unit const* pTarget, SpellEntry const* pSpellEntry)
+{
+    return pSpellEntry->rangeIndex == SPELL_RANGE_IDX_SELF_ONLY ? pCaster : pTarget;
+}
+
 enum PartyBotSpells
 {
     PB_SPELL_FOOD = 1131,
@@ -60,8 +76,8 @@ enum PartyBotSpells
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
-#define PB_AUTO_AOE_MIN_TARGETS 4    // auto AoE when more than 3 enemies stand around the target
-#define PB_AUTO_AOE_RADIUS 10.0f
+#define PB_AUTO_AOE_RADIUS 10.0f     // pack size = enemies within this of the target (incl. the target)
+#define PB_AOE_CC_MARK_RANGE 40.0f   // no auto AoE while a CC-marked enemy is this close
 #define PB_TANK_SAFE_LEAD 1.5f       // tank threat >= this x anyone else's = enemy is safe
 #define PB_TANK_DANGER_LEAD 1.15f    // tank threat below this x someone else's = about to switch
 #define PB_TANK_THREAT_FLOOR 10.0f
@@ -266,30 +282,24 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
 
     if (pSpellEntry->IsAreaOfEffectSpell() && !pSpellEntry->IsPositiveSpell() && !IsInDuel())
     {
-        if (!m_marksToCC.empty())
+        // AoE is free to use (the tank tab-tanks and catches up). Rules: never break crowd control
+        // (forced AoE of damage dealers excepted), never pull enemies that are not fighting yet
+        // (weak ones excepted). Damage dealers with aoe off cast no damaging area spells.
+        bool const dps = m_role == ROLE_MELEE_DPS || m_role == ROLE_RANGE_DPS;
+        if (dps && m_aoeMode == PB_AOE_OFF && IsDamageAreaSpell(pSpellEntry))
+            return false;
+        bool const forced = dps && m_aoeMode == PB_AOE_FORCED;
+
+        // Not near a CC-marked enemy, even before its crowd control lands (tanks: radius rule only).
+        if (!forced && m_role != ROLE_TANK && GetCCMarkedEnemyNearby())
             return false;
 
-        // AoE is free to use (the tank tab-tanks and catches up). Only two rules: never break
-        // crowd control, never pull enemies that are not fighting yet (weak ones excepted).
-        float radius;
-        if (pSpellEntry->EffectRadiusIndex[0])
-            radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[0]));
-        else if (pSpellEntry->EffectRadiusIndex[1])
-            radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[1]));
-        else if (pSpellEntry->EffectRadiusIndex[2])
-            radius = Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpellEntry->EffectRadiusIndex[2]));
-        else
-            radius = 10.0f;
-
-        // Self-centred spells (Arcane Explosion, Whirlwind) hit around the caster.
-        Unit const* pCenter = pSpellEntry->rangeIndex == SPELL_RANGE_IDX_SELF_ONLY ? me : pTarget;
-
         std::list<Unit*> targets;
-        me->GetEnemyListInRadiusAround(pCenter, radius, targets);
+        me->GetEnemyListInRadiusAround(GetAreaCenter(me, pTarget, pSpellEntry), GetAreaRadius(pSpellEntry), targets);
 
         for (auto const& pEnemy : targets)
         {
-            if (pEnemy->HasBreakableByDamageCrowdControlAura())
+            if (!forced && pEnemy->HasBreakableByDamageCrowdControlAura())
                 return false;
 
             if (!pEnemy->IsInCombat() && (pEnemy->GetLevel() + 5) > me->GetLevel() &&
@@ -702,6 +712,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         if (inCombat && !m_wasInCombat)
             WakeUp();
         m_wasInCombat = inCombat;
+
+        UpdateForcedAoE();
     }
 
     m_updateTimer.Update(diff);
@@ -1171,6 +1183,7 @@ void PartyBotAI::OrderStay()
 void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
 {
     EndPullWait("attack order");
+    EndForcedAoE(overrideCC ? "attack order" : "pull order");
     m_orderedTargetGuid = pTarget->GetObjectGuid();
     m_orderOverridesCC = overrideCC;
     if (IsForbiddenTarget(pTarget))
@@ -1287,6 +1300,7 @@ void PartyBotAI::StartPullWait(uint32 duration)
     m_pullWaitStart = WorldTimer::getMSTime();
     m_pullWaitDuration = duration;
     m_approachGuid.Clear();
+    EndForcedAoE("pull order");
     BreakCurrentActions();
     me->StopMoving();
     me->GetMotionMaster()->Clear(false, true);
@@ -2188,7 +2202,7 @@ Unit* PartyBotAI::TabForThreat(Unit* pVictim)
 // - Mark + single focus: only the mark (raids).
 // - Otherwise the tank always goes for loose enemies (attacking a group member without a tank
 //   slot): it switches to them, taunts and builds threat. With a mark it leaves the mark
-//   only while it holds the mark (mark on us, nobody about to pull it) and returns otherwise.
+//   while the mark attacks this tank or another tank, and returns once the mark hits someone else.
 // - Between loose enemies it builds threat on every enemy hitting it (TabForThreat).
 bool PartyBotAI::UpdateTankDuty()
 {
@@ -2224,13 +2238,14 @@ bool PartyBotAI::UpdateTankDuty()
         return TauntIfAllowed(pMark, slots, otherTanks);
     }
 
-    // With a mark: free to leave it only while it is covered - on us and nobody about to pull
-    // it, or held by another tank (then this tank is free for the loose enemies).
+    // With a mark: free to leave it while it is covered - on us (even with a thin threat lead:
+    // enemies already hitting group members come first) or held by another tank.
     Unit* pMarkVictim = pMark ? pMark->GetVictim() : nullptr;
     bool const markHeld = pMarkVictim &&
-        (pMarkVictim == me ? GetThreatLead(pMark, false) >= PB_TANK_DANGER_LEAD :
-                             GetSlotOf(slots, pMarkVictim) != PB_TANK_SLOT_NONE);
-    if (pMark && pVictim != pMark && !markHeld)
+        (pMarkVictim == me || GetSlotOf(slots, pMarkVictim) != PB_TANK_SLOT_NONE);
+    // Back to the mark when it hits someone else; a mark that fights nobody yet (pull target on its
+    // way, or not pulled) waits until no loose enemy is left.
+    if (pMark && pVictim != pMark && !markHeld && (pMarkVictim || !SelectLooseEnemy(slots)))
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s)", me->GetName(),
             pVictim ? pVictim->GetName() : "none", pMark->GetName(), markReason);
@@ -2268,27 +2283,118 @@ bool PartyBotAI::UpdateTankDuty()
     return pMark && TauntIfAllowed(pMark, slots, otherTanks);
 }
 
-bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget, bool forced)
+// Damaging area spells only: fears, roots, stuns and spells without damage (shouts, taunts) are left
+// to the class code.
+bool PartyBotAI::IsDamageAreaSpell(SpellEntry const* pSpellEntry)
+{
+    if (!pSpellEntry->IsAreaOfEffectSpell() || pSpellEntry->IsPositiveSpell())
+        return false;
+
+    bool damage = false;
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        switch (pSpellEntry->EffectApplyAuraName[i])
+        {
+            case SPELL_AURA_MOD_FEAR:
+            case SPELL_AURA_MOD_ROOT:
+            case SPELL_AURA_MOD_STUN:
+            case SPELL_AURA_MOD_CONFUSE:
+                return false;
+            case SPELL_AURA_PERIODIC_DAMAGE:
+                damage = true;
+                break;
+        }
+        switch (pSpellEntry->Effect[i])
+        {
+            case SPELL_EFFECT_SCHOOL_DAMAGE:
+            case SPELL_EFFECT_HEALTH_LEECH:
+            case SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL:
+            case SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
+            case SPELL_EFFECT_WEAPON_DAMAGE:
+            case SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
+                damage = true;
+                break;
+        }
+    }
+    return damage;
+}
+
+bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget)
 {
     for (auto const& pSpell : m_spells.raw.spells)
     {
-        if (!pSpell || !pSpell->IsAreaOfEffectSpell() || pSpell->IsPositiveSpell() ||
-            !pSpell->IsTargetInRange(me, pTarget))
+        if (!pSpell || !IsDamageAreaSpell(pSpell) || !pSpell->IsTargetInRange(me, pTarget))
             continue;
 
-        if (forced)
-        {
-            if (me->GetCurrentSpell(CURRENT_GENERIC_SPELL) &&
-               !me->GetCurrentSpell(CURRENT_GENERIC_SPELL)->m_spellInfo->IsAreaOfEffectSpell())
-                me->InterruptSpell(CURRENT_GENERIC_SPELL);
+        if (!CanTryToCastSpell(pTarget, pSpell) || DoCastSpell(pTarget, pSpell) != SPELL_CAST_OK)
+            continue;
 
-            if (me->CastSpell(pTarget, pSpell, false) == SPELL_CAST_OK)
-                return true;
+        if (m_aoeMode == PB_AOE_FORCED)
+        {
+            // Name crowd-controlled or CC-marked enemies inside the area.
+            std::list<Unit*> targets;
+            me->GetEnemyListInRadiusAround(GetAreaCenter(me, pTarget, pSpell), GetAreaRadius(pSpell), targets);
+            for (auto const& pEnemy : targets)
+                if (pEnemy->HasBreakableByDamageCrowdControlAura() || IsForbiddenTarget(pEnemy))
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: AoE forced, CC mob hit (%s by %s)",
+                        me->GetName(), pEnemy->GetName(), pSpell->SpellName[0].c_str());
         }
-        else if (CanTryToCastSpell(pTarget, pSpell) && DoCastSpell(pTarget, pSpell) == SPELL_CAST_OK)
-            return true;
+        return true;
     }
     return false;
+}
+
+Unit* PartyBotAI::GetCCMarkedEnemyNearby() const
+{
+    Group* pGroup = me->GetGroup();
+    if (!pGroup)
+        return nullptr;
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        PartyBotAI const* pAI = pMember ? dynamic_cast<PartyBotAI const*>(pMember->AI()) : nullptr;
+        if (!pAI)
+            continue;
+        for (auto mark : pAI->m_marksToCC)
+        {
+            Unit* pEnemy = GetMarkedTarget(mark);
+            if (pEnemy && pEnemy->IsAlive() && pEnemy->IsInMap(me) &&
+                me->IsWithinDistInMap(pEnemy, PB_AOE_CC_MARK_RANGE) && IsForbiddenTarget(pEnemy))
+                return pEnemy;
+        }
+    }
+    return nullptr;
+}
+
+void PartyBotAI::SetAoEMode(PartyBotAoEMode mode, char const* why)
+{
+    static char const* const names[] = { "auto", "on", "off" };
+    if (mode == m_aoeMode)
+        return;
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: aoe %s -> %s (%s)", me->GetName(), names[m_aoeMode],
+        names[mode], why);
+    m_aoeMode = mode;
+    m_forcedAoEFought = false;
+}
+
+void PartyBotAI::EndForcedAoE(char const* why)
+{
+    if (m_aoeMode == PB_AOE_FORCED)
+        SetAoEMode(PB_AOE_AUTO, why);
+}
+
+// Forced AoE lasts one fight: it ends once the bot has fought and is out of combat (pack dead).
+void PartyBotAI::UpdateForcedAoE()
+{
+    if (m_aoeMode != PB_AOE_FORCED)
+        return;
+
+    if (me->IsInCombat())
+        m_forcedAoEFought = true;
+    else if (m_forcedAoEFought)
+        EndForcedAoE("fight over");
 }
 
 void PartyBotAI::UpdateInCombatAI()
@@ -2314,13 +2420,20 @@ void PartyBotAI::UpdateInCombatAI()
             if (!me->CanReachWithMeleeAutoAttack(pVictim) && ShootRangedWeapon(pVictim))
                 return;
 
-    // Auto AoE: damage dealers on a pack of more than 3 enemies (CC marks and not-yet-pulled
-    // mobs are still protected by CanTryToCastSpell).
-    if (m_autoAoE && !IsInDuel() && (m_role == ROLE_MELEE_DPS || m_role == ROLE_RANGE_DPS))
+    // Area spells of damage dealers: auto on a pack of PartyBot.AutoAoE.MinTargets+ enemies around
+    // the target, forced on any pack. CanTryToCastSpell keeps the crowd control and not-yet-pulled
+    // rules (forced: not-yet-pulled only).
+    if (m_aoeMode != PB_AOE_OFF && !IsInDuel() && (m_role == ROLE_MELEE_DPS || m_role == ROLE_RANGE_DPS))
+    {
         if (Unit* pVictim = me->GetVictim())
-            if (me->GetEnemyCountInRadiusAround(pVictim, PB_AUTO_AOE_RADIUS) >= PB_AUTO_AOE_MIN_TARGETS &&
-                CastAreaOfEffectSpell(pVictim, false))
+        {
+            uint32 const minTargets = m_aoeMode == PB_AOE_FORCED ? 1 :
+                sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_AUTO_AOE_MIN_TARGETS);
+            if (me->GetEnemyCountInRadiusAround(pVictim, PB_AUTO_AOE_RADIUS) >= minTargets &&
+                CastAreaOfEffectSpell(pVictim))
                 return;
+        }
+    }
 
     switch (me->GetClass())
     {
@@ -3733,6 +3846,14 @@ void PartyBotAI::UpdateOutOfCombatAI_Warrior()
 
 void PartyBotAI::UpdateInCombatAI_Warrior()
 {
+    // Tank: Defensive Stance first in every fight (more threat, Revenge); out of combat the bot
+    // returns to Battle Stance for Charge.
+    if (m_role == ROLE_TANK && m_spells.warrior.pDefensiveStance &&
+        !me->HasAura(m_spells.warrior.pDefensiveStance->Id) &&
+        CanTryToCastSpell(me, m_spells.warrior.pDefensiveStance) &&
+        DoCastSpell(me, m_spells.warrior.pDefensiveStance) == SPELL_CAST_OK)
+        return;
+
     if (Unit* pVictim = me->GetVictim())
     {
         if (pVictim->IsNonMeleeSpellCasted(false, false, true))
@@ -3959,7 +4080,7 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
         }
 
         if ((me->GetHealthPercent() < 20.0f) ||
-            (m_role == ROLE_TANK && pVictim->GetLevel() >= me->GetLevel()))
+            m_role == ROLE_TANK)
         {
             if (m_spells.warrior.pDefensiveStance &&
                 CanTryToCastSpell(me, m_spells.warrior.pDefensiveStance))

@@ -284,7 +284,6 @@ class ChatHandler
         bool HandlePartyBotSlotCommand(char * args);
         bool HandlePartyBotSlotsCommand(char * args);
         bool HandlePartyBotSingleFocusCommand(char * args);
-        bool HandlePartyBotAutoAoECommand(char * args);
         bool HandlePartyBotOnOffHelper(char* args, char const* name, uint8 setting);
         bool HandlePartyBotAttackStartCommand(char * args);
         bool HandlePartyBotAttackStopCommand(char * args);

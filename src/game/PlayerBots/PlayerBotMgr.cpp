@@ -1351,7 +1351,6 @@ bool ChatHandler::HandlePartyBotSlotsCommand(char* /*args*/)
 enum PartyBotOnOffSetting : uint8
 {
     PB_SETTING_SINGLE_FOCUS,
-    PB_SETTING_AUTO_AOE,
 };
 
 static void SetPartyBotOnOffSetting(PartyBotAI* pAI, uint8 setting, bool on)
@@ -1360,9 +1359,6 @@ static void SetPartyBotOnOffSetting(PartyBotAI* pAI, uint8 setting, bool on)
     {
         case PB_SETTING_SINGLE_FOCUS:
             pAI->m_singleFocus = on;
-            break;
-        case PB_SETTING_AUTO_AOE:
-            pAI->m_autoAoE = on;
             break;
     }
 }
@@ -1420,12 +1416,6 @@ bool ChatHandler::HandlePartyBotOnOffHelper(char* args, char const* name, uint8 
 bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
 {
     return HandlePartyBotOnOffHelper(args, "singlefocus", PB_SETTING_SINGLE_FOCUS);
-}
-
-// .partybot autoaoe on|off [all]: damage dealers use area spells on big packs (default on).
-bool ChatHandler::HandlePartyBotAutoAoECommand(char* args)
-{
-    return HandlePartyBotOnOffHelper(args, "autoaoe", PB_SETTING_AUTO_AOE);
 }
 
 bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
@@ -1530,13 +1520,41 @@ bool ChatHandler::HandlePartyBotAttackStopCommand(char* args)
     return true;
 }
 
+// .partybot aoe auto|on|off [all]: area spells of damage dealers. auto (default): packs of
+// PartyBot.AutoAoE.MinTargets+ and never near crowd control; on: forced for one fight (any pack,
+// also near crowd control; ends on fight over, attack, pull, aoe auto/off); off: none.
+// A selected bot wins over "all".
 bool ChatHandler::HandlePartyBotAoECommand(char* args)
 {
-    Player* pPlayer = GetSession()->GetPlayer();
-    Unit* pTarget = GetSelectedUnit();
-    if (!pTarget || !pPlayer->IsValidAttackTarget(pTarget, true))
+    char* arg1 = ExtractArg(&args);
+    char* arg2 = ExtractArg(&args);
+    PartyBotAoEMode mode;
+    if (arg1 && strcmp(arg1, "auto") == 0)
+        mode = PB_AOE_AUTO;
+    else if (arg1 && strcmp(arg1, "on") == 0)
+        mode = PB_AOE_FORCED;
+    else if (arg1 && strcmp(arg1, "off") == 0)
+        mode = PB_AOE_OFF;
+    else
     {
-        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SendSysMessage("Usage: .partybot aoe auto|on|off [all]");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Player* pPlayer = GetSession()->GetPlayer();
+    Player* pTarget = GetSelectedPlayer();
+    if (pTarget && pTarget != pPlayer && dynamic_cast<PartyBotAI*>(pTarget->AI()))
+    {
+        GetCommandedPartyBotAI(pTarget)->SetAoEMode(mode, "command");
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: aoe %s -> %s", pPlayer->GetName(), arg1, pTarget->GetName());
+        PSendSysMessage("%s: aoe %s.", pTarget->GetName(), arg1);
+        return true;
+    }
+
+    if (!arg2 || strcmp(arg2, "all") != 0)
+    {
+        SendSysMessage("Select a party bot or add 'all'.");
         SetSentErrorMessage(true);
         return false;
     }
@@ -1550,21 +1568,12 @@ bool ChatHandler::HandlePartyBotAoECommand(char* args)
     }
 
     for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
-    {
         if (Player* pMember = itr->getSource())
-        {
-            if (pMember == pPlayer)
-                continue;
+            if (pMember != pPlayer && dynamic_cast<PartyBotAI*>(pMember->AI()))
+                GetCommandedPartyBotAI(pMember)->SetAoEMode(mode, "command");
 
-            if (pMember->AI())
-            {
-                if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
-                    pAI->CastAreaOfEffectSpell(pTarget, true);
-            }
-        }
-    }
-
-    PSendSysMessage("All party bots are casting AoE spells at %s.", pTarget->GetName());
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: aoe %s -> all bots", pPlayer->GetName(), arg1);
+    PSendSysMessage("All party bots: aoe %s.", arg1);
     return true;
 }
 
