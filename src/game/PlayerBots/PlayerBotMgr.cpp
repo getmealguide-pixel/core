@@ -861,7 +861,7 @@ bool ChatHandler::PartyBotAddRequirementCheck(Player const* pPlayer, Player cons
 }
 
 // All .partybot commands look up bots through here, so a commanded bot reacts on the next
-// world tick instead of waiting for its next AI update (up to PB_UPDATE_INTERVAL).
+// world tick instead of waiting for its next AI update (up to PartyBot.UpdateInterval).
 static PartyBotAI* GetCommandedPartyBotAI(Player* pBot)
 {
     PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pBot->AI());
@@ -1415,7 +1415,8 @@ bool ChatHandler::HandlePartyBotOnOffHelper(char* args, char const* name, uint8 
     return true;
 }
 
-// .partybot singlefocus on|off [all]: tank only its focus mark (on) or also loose enemies (off).
+// .partybot singlefocus on|off [all]: tank lock. On: tanks stay on their preferred target (attack
+// order, skull or focus mark) only; off: they also grab loose enemies. No effect on other roles.
 bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
 {
     return HandlePartyBotOnOffHelper(args, "singlefocus", PB_SETTING_SINGLE_FOCUS);
@@ -1446,6 +1447,8 @@ bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
         return false;
     }
 
+    // Healers keep healing (they have no attack duty); everyone else leaves stay and attacks.
+    std::string attackers;
     for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
     {
         if (Player* pMember = itr->getSource())
@@ -1457,19 +1460,25 @@ bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
             {
                 if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
-                    if (pMember->IsValidAttackTarget(pTarget))
-                        pAI->AttackStart(pTarget);
+                    if (pAI->GetRole() != ROLE_HEALER && pMember->IsValidAttackTarget(pTarget))
+                    {
+                        pAI->OrderAttack(pTarget);
+                        attackers += attackers.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
+                    }
                 }
             }
         }
     }
 
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: attack %s -> %s", pPlayer->GetName(), pTarget->GetName(),
+        attackers.empty() ? "nobody" : attackers.c_str());
     PSendSysMessage("All party bots are now attacking %s.", pTarget->GetName());
     return true;
 }
 
 void StopPartyBotAttackHelper(PartyBotAI* pAI, Player* pBot)
 {
+    pAI->ClearOrderedTarget();
     pBot->AttackStop(true);
     pBot->InterruptNonMeleeSpells(false);
     if (!pBot->IsStopped())
@@ -1625,7 +1634,7 @@ bool ChatHandler::HandlePartyBotToggleCastingCommand(bool allowCasting)
                     else
                     {
                         pAI->m_preventCasting = true;
-                        pTarget->InterruptNonMeleeSpells(false);
+                        pMember->InterruptNonMeleeSpells(false);
                     }
                 }
             }
@@ -1674,6 +1683,8 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
             {
                 PSendSysMessage("%s will crowd control %s.", pTarget->GetName(), args);
                 pAI->m_marksToCC.push_back(itrMark->second);
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: ccmark %s -> %s (no bot attacks it unless ordered)",
+                    pPlayer->GetName(), args, pTarget->GetName());
                 return true;
             }
         }
@@ -1707,6 +1718,8 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
         }
     }
 
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: ccmark %s -> all bots (no bot attacks it unless ordered)",
+        pPlayer->GetName(), args);
     PSendSysMessage("All party bots will crowd control %s.", args);
     return true;
 }
@@ -1739,6 +1752,8 @@ bool ChatHandler::HandlePartyBotFocusMarkCommand(char* args)
 
                 PSendSysMessage("%s will focus %s.", pTarget->GetName(), args);
                 pAI->m_marksToFocus.push_back(itrMark->second);
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: focusmark %s -> %s", pPlayer->GetName(), args,
+                    pTarget->GetName());
                 return true;
             }
         }
@@ -1777,6 +1792,7 @@ bool ChatHandler::HandlePartyBotFocusMarkCommand(char* args)
         }
     }
 
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: focusmark %s -> all bots", pPlayer->GetName(), args);
     PSendSysMessage("All party bots will focus %s.", args);
     return true;
 }
@@ -1793,6 +1809,7 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
             if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 PSendSysMessage("All mark assignments cleared for %s.", pTarget->GetName());
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: clearmarks -> %s", pPlayer->GetName(), pTarget->GetName());
                 pAI->m_marksToCC.clear();
                 pAI->m_marksToFocus.clear();
                 return true;
@@ -1829,6 +1846,7 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
         }
     }
 
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: clearmarks -> all bots", pPlayer->GetName());
     SendSysMessage("Mark assignments cleared for all bots.");
     return true;
 }
@@ -2287,10 +2305,13 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
         return false;
     }
 
-    uint32 duration;
-    if (!ExtractUInt32(&args, duration))
-        duration = 10 * IN_MILLISECONDS;
+    // .partybot pull [seconds]: damage dealers wait this long (default 10 s).
+    uint32 seconds;
+    if (!ExtractUInt32(&args, seconds))
+        seconds = 10;
+    uint32 const duration = seconds * IN_MILLISECONDS;
 
+    std::string tanks, paused;
     for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
     {
         if (Player* pMember = itr->getSource())
@@ -2305,19 +2326,25 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
                     if (pAI->m_role == ROLE_MELEE_DPS || pAI->m_role == ROLE_RANGE_DPS)
                     {
                         HandlePartyBotPauseApplyHelper(pMember, duration);
+                        paused += paused.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
                         continue;
                     }
                     else if (pAI->m_role == ROLE_TANK)
                     {
                         if (pMember->IsValidAttackTarget(pTarget))
-                            pAI->AttackStart(pTarget);
+                        {
+                            pAI->OrderAttack(pTarget);
+                            tanks += tanks.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
+                        }
                     }
                 }
             }
         }
     }
 
-    PSendSysMessage("Tank party bots are pulling %s, DPS party bots are paused for %d seconds.", pTarget->GetName(), (duration / IN_MILLISECONDS));
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: pull %s, tank %s, DPS paused %u s: %s", pPlayer->GetName(),
+        pTarget->GetName(), tanks.empty() ? "none" : tanks.c_str(), seconds, paused.empty() ? "none" : paused.c_str());
+    PSendSysMessage("Tank party bots are pulling %s, DPS party bots are paused for %u seconds.", pTarget->GetName(), seconds);
     return true;
 }
 

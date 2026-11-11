@@ -3148,6 +3148,30 @@ void CombatBotBaseAI::AutoEquipGear(uint32 option)
     UpdateVisualHonorRankBasedOnItems();
 }
 
+// A cast-time nuke whose direct damage is bigger than the aura it leaves (Frostbolt's slow,
+// Fireball's and Pyroblast's burn): worth casting again while that aura is still on the target.
+// Damage-over-time-first spells (Immolate) and instants (Hamstring, Frost Shock) are not.
+static bool IsNukeWithSideAura(SpellEntry const* pSpellEntry, Player const* pCaster)
+{
+    if (!pSpellEntry->GetCastTime(pCaster))
+        return false;
+
+    int32 direct = 0;
+    int32 periodic = 0;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        SpellEffectIndex const eff = SpellEffectIndex(i);
+        if (pSpellEntry->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE)
+            direct += pSpellEntry->CalculateSimpleValue(eff);
+        else if (Spells::IsEffectAppliesAura(pSpellEntry->Effect[i]) &&
+                 pSpellEntry->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE &&
+                 pSpellEntry->EffectAmplitude[i])
+            periodic += pSpellEntry->CalculateSimpleValue(eff) *
+                (pSpellEntry->GetDuration() / int32(pSpellEntry->EffectAmplitude[i]));
+    }
+    return direct > 0 && direct > periodic;
+}
+
 bool CombatBotBaseAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpellEntry) const
 {
     if (m_preventCasting)
@@ -3186,9 +3210,11 @@ bool CombatBotBaseAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* p
     if (pSpellEntry->GetErrorAtShapeshiftedCast(me->GetShapeshiftForm()) != SPELL_CAST_OK)
         return false;
 
-    // Stacking warrior debuffs (Sunder Armor): the caller decides on stacks and refresh.
+    // Aura already on the target: not again. Exceptions: stacking warrior debuffs (Sunder
+    // Armor; the caller decides on stacks and refresh) and nukes with a side aura (Frostbolt).
     if (pSpellEntry->IsSpellAppliesAura() && pTarget->HasAura(pSpellEntry->Id) &&
-       !(pSpellEntry->SpellFamilyName == SPELLFAMILY_WARRIOR && pSpellEntry->GetStackAmount() > 1))
+       !(pSpellEntry->SpellFamilyName == SPELLFAMILY_WARRIOR && pSpellEntry->GetStackAmount() > 1) &&
+       !IsNukeWithSideAura(pSpellEntry, me))
         return false;
 
     SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex);
@@ -3219,7 +3245,9 @@ SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pS
     me->SetTargetGuid(pTarget->GetObjectGuid());
     auto result = me->CastSpell(pTarget, pSpellEntry, false);
 
-    //printf("cast %s result %u\n", pSpellEntry->SpellName[0].c_str(), result);
+    if (result == SPELL_CAST_OK)
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Cast] %s: %s (%u) on %s", me->GetName(),
+            pSpellEntry->SpellName[0].c_str(), pSpellEntry->Id, pTarget->GetName());
 
     if ((result == SPELL_FAILED_MOVING ||
         result == SPELL_CAST_OK) &&

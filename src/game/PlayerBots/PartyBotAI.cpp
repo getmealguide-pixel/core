@@ -31,6 +31,12 @@
 #include <mutex>
 #include <random>
 
+// Time between two AI updates (config PartyBot.UpdateInterval).
+static uint32 GetUpdateInterval()
+{
+    return sWorld.getConfig(CONFIG_UINT32_PARTY_BOT_UPDATE_INTERVAL);
+}
+
 enum PartyBotSpells
 {
     PB_SPELL_FOOD = 1131,
@@ -40,7 +46,6 @@ enum PartyBotSpells
     PB_SPELL_HONORLESS_TARGET = 2479,
 };
 
-#define PB_UPDATE_INTERVAL 1000
 #define PB_MIN_FOLLOW_DIST 3.0f
 #define PB_MAX_FOLLOW_DIST 6.0f
 #define PB_MIN_FOLLOW_ANGLE 0.0f
@@ -140,62 +145,6 @@ Player* PartyBotAI::GetPartyLeader() const
         return originalLeader;
     }
     return nullptr;
-}
-
-bool PartyBotAI::IsValidDistancingTarget(Unit* pTarget, Unit* pEnemy)
-{
-    if (pTarget->IsInWorld() && pTarget->IsAlive() &&
-        pTarget->GetMap() == me->GetMap())
-    {
-        float const distance = me->GetDistance(pTarget);
-        if (distance >= 15.0f && distance <= 30.0f &&
-            pTarget->GetDistance(pEnemy) >= 15.0f)
-            return true;
-    }
-
-    return false;
-}
-
-Unit* PartyBotAI::GetDistancingTarget(Unit* pEnemy)
-{
-    if (Player* pLeader = GetPartyLeader())
-        if (IsValidDistancingTarget(pLeader, pEnemy))
-            return pLeader;
-
-    Unit* pNonTank = nullptr;
-    Group* pGroup = me->GetGroup();
-    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
-    {
-        if (Player* pMember = itr->getSource())
-        {
-            if (pMember == me)
-                continue;
-
-            if (IsValidDistancingTarget(pMember, pEnemy))
-            {
-                if (IsTankingForm(pMember->GetShapeshiftForm()) || IsWearingShield(pMember))
-                    return pMember;
-                else
-                    pNonTank = pMember;
-            }
-        }
-    }
-
-    return pNonTank;
-}
-
-bool PartyBotAI::RunAwayFromTarget(Unit* pEnemy)
-{
-    if (!CanMoveOnOwn())
-        return false;
-
-    if (Unit* pTarget = GetDistancingTarget(pEnemy))
-    {
-        me->MonsterMove(pTarget->GetPositionX(), pTarget->GetPositionY(), pTarget->GetPositionZ());
-        return true;
-    }
-
-    return me->GetMotionMaster()->MoveDistance(pEnemy, 15.0f);
 }
 
 bool PartyBotAI::DrinkAndEat()
@@ -390,56 +339,62 @@ Unit* PartyBotAI::GetMarkedTarget(RaidTargetIcon mark) const
     return nullptr;
 }
 
-Unit* PartyBotAI::SelectAttackTarget(Player* pLeader) const
+Unit* PartyBotAI::SelectAttackTarget(Player* pLeader, char const*& reason) const
 {
     if (IsInDuel())
     {
         if (me->m_duel->opponent && IsValidHostileTarget(me->m_duel->opponent))
+        {
+            reason = "duel";
             return me->m_duel->opponent;
+        }
     }
     else
     {
-        // Stick to marked target in combat.
-        if (me->IsInCombat() || pLeader->GetVictim())
-        {
-            for (auto markId : m_marksToFocus)
-            {
-                ObjectGuid targetGuid = me->GetGroup()->GetTargetWithIcon(markId);
-                if (targetGuid.IsUnit())
-                    if (Unit* pVictim = me->GetMap()->GetUnit(targetGuid))
-                        if (IsValidHostileTarget(pVictim))
-                            return pVictim;
-            }
-        }
+        // Ordered target, skull, focus marks.
+        if (Unit* pPreferred = GetPreferredTarget(reason))
+            return pPreferred;
 
         // Who is the leader attacking.
         if (Unit* pVictim = pLeader->GetVictim())
         {
-            if (IsValidHostileTarget(pVictim))
+            if (IsValidHostileTarget(pVictim) && !IsForbiddenTarget(pVictim))
+            {
+                reason = "leader's target";
                 return pVictim;
+            }
         }
     }
 
     // Who is attacking me.
     for (const auto pAttacker : me->GetAttackers())
     {
-        if (IsValidHostileTarget(pAttacker))
+        if (IsValidHostileTarget(pAttacker) && !IsForbiddenTarget(pAttacker))
+        {
+            reason = "attacks me";
             return pAttacker;
+        }
     }
 
     if (!IsInDuel())
     {
         // Check if other group members are under attack.
         if (Unit* pPartyAttacker = SelectPartyAttackTarget())
+        {
+            reason = "attacks a group member";
             return pPartyAttacker;
+        }
     }
 
     // Assist pet if its in combat.
     if (Pet* pPet = me->GetPet())
     {
         if (Unit* pPetAttacker = pPet->GetAttackerForHelper())
-            if (IsValidHostileTarget(pPetAttacker))
+            if (IsValidHostileTarget(pPetAttacker) && !IsForbiddenTarget(pPetAttacker))
+            {
+                reason = "attacks my pet";
                 return pPetAttacker;
+            }
     }
 
     return nullptr;
@@ -458,7 +413,7 @@ Unit* PartyBotAI::SelectPartyAttackTarget() const
 
             for (const auto pAttacker : pMember->GetAttackers())
             {
-                if (IsValidHostileTarget(pAttacker) &&
+                if (IsValidHostileTarget(pAttacker) && !IsForbiddenTarget(pAttacker) &&
                     me->IsWithinDist(pAttacker, 50.0f))
                     return pAttacker;
             }
@@ -647,11 +602,18 @@ void PartyBotAI::UpdateAI(uint32 const diff)
             StandUpToFollow();
 
         FaceCombatTarget();
+
+        // Entering combat (attacked, or the group pulled): think on the next tick, not after
+        // the rest of the update interval.
+        bool const inCombat = me->IsInCombat();
+        if (inCombat && !m_wasInCombat)
+            WakeUp();
+        m_wasInCombat = inCombat;
     }
 
     m_updateTimer.Update(diff);
     if (m_updateTimer.Passed())
-        m_updateTimer.Reset(PB_UPDATE_INTERVAL);
+        m_updateTimer.Reset(GetUpdateInterval());
     else
         return;
 
@@ -931,18 +893,58 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         }
     }
 
+    // An attack/pull order ends when its target is gone (dead, despawned).
+    if (!m_orderedTargetGuid.IsEmpty())
+    {
+        Unit* pOrdered = me->GetMap()->GetUnit(m_orderedTargetGuid);
+        if (!pOrdered || !pOrdered->IsAlive())
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: ordered target gone, back to normal targets", me->GetName());
+            ClearOrderedTarget();
+        }
+    }
+
     Unit* pVictim = me->GetVictim();
 
     if (GetRole() != ROLE_HEALER)
     {
+        if (pVictim && IsValidHostileTarget(pVictim))
+        {
+            char const* reason = "";
+            if (IsForbiddenTarget(pVictim))
+            {
+                // Never hit a CC mark unless ordered to (it may be about to be crowd controlled).
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: leaves %s (CC mark)", me->GetName(), pVictim->GetName());
+                me->AttackStop(true);
+                pVictim = nullptr;
+            }
+            else if (m_role != ROLE_TANK)
+            {
+                // Damage dealers switch at once to the ordered target, the skull or a focus mark
+                // (tanks decide in UpdateTankDuty).
+                Unit* pPreferred = GetPreferredTarget(reason);
+                if (pPreferred && pPreferred != pVictim)
+                {
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s)", me->GetName(),
+                        pVictim->GetName(), pPreferred->GetName(), reason);
+                    me->AttackStop(true);
+                    AttackStart(pPreferred);
+                    return;
+                }
+            }
+        }
+
         if (!pVictim || !IsValidHostileTarget(pVictim))
         {
             if (pVictim)
                 me->AttackStop();
 
-            if (Unit* pVictim = SelectAttackTarget(pLeader))
+            char const* reason = "";
+            if (Unit* pNewVictim = SelectAttackTarget(pLeader, reason))
             {
-                AttackStart(pVictim);
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: picks %s (%s)", me->GetName(),
+                    pNewVictim->GetName(), reason);
+                AttackStart(pNewVictim);
                 return;
             }
         }
@@ -1057,10 +1059,37 @@ void PartyBotAI::OrderStay()
     SetHoldPosition(true);
 }
 
+void PartyBotAI::OrderAttack(Unit* pTarget)
+{
+    if (m_holdPosition)
+    {
+        // After the fight the bot follows the leader again (it does not return to the spot).
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: leaves stay to attack %s", me->GetName(), pTarget->GetName());
+        SetHoldPosition(false);
+    }
+
+    m_orderedTargetGuid = pTarget->GetObjectGuid();
+    if (me->GetVictim() && me->GetVictim() != pTarget)
+        me->AttackStop(true);
+    AttackStart(pTarget);
+}
+
+void PartyBotAI::ClearOrderedTarget()
+{
+    m_orderedTargetGuid.Clear();
+}
+
 // Hold a given spot (comestay: the leader's position; aedm "move here": the clicked ground);
-// ReturnToHoldSpot walks there and keeps the bot there like stay.
+// ReturnToHoldSpot walks there and keeps the bot there like stay. The order wins at once over
+// whatever the bot is doing: casts, eating/drinking, attacks and attack orders are dropped.
 void PartyBotAI::OrderHoldSpot(uint32 mapId, float x, float y, float z)
 {
+    BreakCurrentActions();
+    ClearOrderedTarget();
+    if (me->GetVictim())
+        me->AttackStop(true);
+    m_moveOrderTime = WorldTimer::getMSTime();
+
     SetFollowMode(PB_FOLLOW_LOOSE);
     SetHoldPosition(true);
 
@@ -1072,6 +1101,7 @@ void PartyBotAI::OrderHoldSpot(uint32 mapId, float x, float y, float z)
 
 void PartyBotAI::OrderFollow()
 {
+    ClearOrderedTarget();
     SetHoldPosition(false);
     SetFollowMode(PB_FOLLOW_ARRIVE);
     BreakActionsAndFollowNow();
@@ -1079,18 +1109,26 @@ void PartyBotAI::OrderFollow()
 
 void PartyBotAI::OrderStackedFollow(bool stacked)
 {
+    ClearOrderedTarget();
     SetHoldPosition(false);
     SetFollowMode(stacked ? PB_FOLLOW_STACKED : PB_FOLLOW_LOOSE);
     if (stacked)
         BreakActionsAndFollowNow();
 }
 
-// Follow orders win over whatever the bot is doing: stop casting, eating and drinking,
-// stand up and start moving to the leader right away (not on the next AI update).
-void PartyBotAI::BreakActionsAndFollowNow()
+// Movement orders win over whatever the bot is doing: stop casting (also channels), eating and
+// drinking, and stand up.
+void PartyBotAI::BreakCurrentActions()
 {
     if (!me->IsAlive() || me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
         return;
+
+    Spell const* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+    if (!pSpell)
+        pSpell = me->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+    if (pSpell)
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Order] %s: stops casting %s for the order", me->GetName(),
+            pSpell->m_spellInfo->SpellName[0].c_str());
 
     me->InterruptNonMeleeSpells(false);
     me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
@@ -1098,6 +1136,16 @@ void PartyBotAI::BreakActionsAndFollowNow()
     if (me->GetStandState() != UNIT_STAND_STATE_STAND)
         me->SetStandState(UNIT_STAND_STATE_STAND);
     m_isBuffing = false;
+}
+
+// Follow orders: break current actions and start moving to the leader right away (not on the
+// next AI update).
+void PartyBotAI::BreakActionsAndFollowNow()
+{
+    if (!me->IsAlive() || me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+        return;
+
+    BreakCurrentActions();
 
     if (Player* pLeader = GetPartyLeader())
         if (pLeader->IsInWorld() && me->IsInMap(pLeader))
@@ -1193,7 +1241,7 @@ void PartyBotAI::ReactToLeaderMovement()
     m_leaderWasMoving = leaderMoving;
 
     // Not while paused (an active pause keeps the update timer longer than one interval).
-    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > PB_UPDATE_INTERVAL)
+    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > GetUpdateInterval())
         return;
 
     if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
@@ -1216,7 +1264,7 @@ void PartyBotAI::StandUpToFollow()
         return;
 
     // Not while paused (an active pause keeps the update timer longer than one interval).
-    if (m_updateTimer.GetExpiry() > PB_UPDATE_INTERVAL)
+    if (m_updateTimer.GetExpiry() > GetUpdateInterval())
         return;
 
     Player* pLeader = GetPartyLeader();
@@ -1249,7 +1297,7 @@ void PartyBotAI::SetHoldPosition(bool hold)
 // Run the AI on the next world tick. An active pause (timer longer than one interval) is kept.
 void PartyBotAI::WakeUp()
 {
-    if (m_updateTimer.GetExpiry() <= PB_UPDATE_INTERVAL)
+    if (m_updateTimer.GetExpiry() <= GetUpdateInterval())
         m_updateTimer.Reset(0);
 }
 
@@ -1275,6 +1323,7 @@ bool PartyBotAI::ReturnToHoldSpot()
     float const distance = me->GetDistance(m_holdX, m_holdY, m_holdZ, SizeFactor::None);
     if (distance <= PB_HOLD_SPOT_TOLERANCE)
     {
+        m_moveOrderTime = 0;
         if (m_returningToHoldSpot)
         {
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: back on spot", me->GetName());
@@ -1285,7 +1334,12 @@ bool PartyBotAI::ReturnToHoldSpot()
 
     if (!m_returningToHoldSpot)
     {
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %.1f yd from spot, moving there", me->GetName(), distance);
+        if (m_moveOrderTime)
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %.1f yd from spot, moving there (%u ms after the order)",
+                me->GetName(), distance, WorldTimer::getMSTimeDiffToNow(m_moveOrderTime));
+        else
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: %.1f yd from spot, moving there", me->GetName(), distance);
+        m_moveOrderTime = 0;
         m_returningToHoldSpot = true;
         m_returnBestDistance = distance;
         m_returnProgressTime = WorldTimer::getMSTime();
@@ -1654,17 +1708,70 @@ uint8 PartyBotAI::GetHealPriority(Unit const* pUnit) const
     }
 }
 
-Unit* PartyBotAI::GetFocusMarkTarget() const
+Unit* PartyBotAI::GetPreferredTarget(char const*& reason) const
 {
-    for (auto markId : m_marksToFocus)
+    if (!m_orderedTargetGuid.IsEmpty())
+        if (Unit* pOrdered = me->GetMap()->GetUnit(m_orderedTargetGuid))
+            if (IsValidHostileTarget(pOrdered))
+            {
+                reason = "ordered";
+                return pOrdered;
+            }
+
+    return GetFocusMarkTarget(reason);
+}
+
+// The skull is always a focus mark; focusmark adds more. A mark counts only once it is fighting
+// (bots never pull a marked pack on their own) and never when it is a CC mark.
+Unit* PartyBotAI::GetFocusMarkTarget(char const*& reason) const
+{
+    Group* pGroup = me->GetGroup();
+    if (!pGroup)
+        return nullptr;
+
+    auto const isUsable = [this](Unit* pTarget)
     {
-        ObjectGuid targetGuid = me->GetGroup()->GetTargetWithIcon(markId);
-        if (targetGuid.IsUnit())
-            if (Unit* pTarget = me->GetMap()->GetUnit(targetGuid))
-                if (IsValidHostileTarget(pTarget))
-                    return pTarget;
-    }
+        return pTarget && pTarget->IsInCombat() && IsValidHostileTarget(pTarget) && !IsForbiddenTarget(pTarget);
+    };
+
+    if (Unit* pSkull = GetMarkedTarget(RAID_TARGET_ICON_SKULL))
+        if (isUsable(pSkull))
+        {
+            reason = "skull";
+            return pSkull;
+        }
+
+    for (auto markId : m_marksToFocus)
+        if (Unit* pTarget = GetMarkedTarget(markId))
+            if (isUsable(pTarget))
+            {
+                reason = "focus mark";
+                return pTarget;
+            }
+
     return nullptr;
+}
+
+bool PartyBotAI::IsForbiddenTarget(Unit const* pTarget) const
+{
+    if (pTarget->GetObjectGuid() == m_orderedTargetGuid)
+        return false;
+
+    Group* pGroup = me->GetGroup();
+    if (!pGroup)
+        return false;
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        PartyBotAI const* pAI = pMember ? dynamic_cast<PartyBotAI const*>(pMember->AI()) : nullptr;
+        if (!pAI)
+            continue;
+        for (auto mark : pAI->m_marksToCC)
+            if (pGroup->GetTargetWithIcon(mark) == pTarget->GetObjectGuid())
+                return true;
+    }
+    return false;
 }
 
 // Nearest enemy attacking a group member without a tank slot, that no other tank bot is
@@ -1683,7 +1790,7 @@ Unit* PartyBotAI::SelectLooseEnemy(PartyBotTankSlotMap const& slots) const
 
         for (auto const pAttacker : pMember->GetAttackers())
         {
-            if (!IsValidHostileTarget(pAttacker) || !me->IsWithinDist(pAttacker, 50.0f))
+            if (!IsValidHostileTarget(pAttacker) || IsForbiddenTarget(pAttacker) || !me->IsWithinDist(pAttacker, 50.0f))
                 continue;
 
             bool claimed = false;
@@ -1793,7 +1900,7 @@ Unit* PartyBotAI::TabForThreat(Unit* pVictim)
     for (auto const pAttacker : me->GetAttackers())
     {
         if (pAttacker == pVictim || pAttacker->GetVictim() != me ||
-           !IsValidHostileTarget(pAttacker) ||
+           !IsValidHostileTarget(pAttacker) || IsForbiddenTarget(pAttacker) ||
             pAttacker->HasBreakableByDamageCrowdControlAura() ||
            !me->CanReachWithMeleeAutoAttack(pAttacker))
             continue;
@@ -1828,10 +1935,11 @@ Unit* PartyBotAI::TabForThreat(Unit* pVictim)
     return pBest;
 }
 
-// Tank role duty.
-// - Focus mark + single focus: only the mark (raids).
+// Tank role duty. "Mark" below = the preferred target: attack/pull order, else skull, else a
+// focus mark (GetPreferredTarget).
+// - Mark + single focus: only the mark (raids).
 // - Otherwise the tank always goes for loose enemies (attacking a group member without a tank
-//   slot): it switches to them, taunts and builds threat. With a focus mark it leaves the mark
+//   slot): it switches to them, taunts and builds threat. With a mark it leaves the mark
 //   only while it holds the mark (mark on us, nobody about to pull it) and returns otherwise.
 // - Between loose enemies it builds threat on every enemy hitting it (TabForThreat).
 bool PartyBotAI::UpdateTankDuty()
@@ -1854,11 +1962,14 @@ bool PartyBotAI::UpdateTankDuty()
     if (pVictim && !IsValidHostileTarget(pVictim))
         pVictim = nullptr;
 
-    Unit* pMark = GetFocusMarkTarget();
+    char const* markReason = "";
+    Unit* pMark = GetPreferredTarget(markReason);
     if (pMark && m_singleFocus)
     {
         if (pVictim != pMark)
         {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s, singlefocus)", me->GetName(),
+                pVictim ? pVictim->GetName() : "none", pMark->GetName(), markReason);
             me->AttackStop(true);
             AttackStart(pMark);
         }
@@ -1873,6 +1984,8 @@ bool PartyBotAI::UpdateTankDuty()
                              GetSlotOf(slots, pMarkVictim) != PB_TANK_SLOT_NONE);
     if (pMark && pVictim != pMark && !markHeld)
     {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s)", me->GetName(),
+            pVictim ? pVictim->GetName() : "none", pMark->GetName(), markReason);
         me->AttackStop(true);
         AttackStart(pMark);
         return TauntIfAllowed(pMark, slots, otherTanks);
@@ -2665,18 +2778,6 @@ void PartyBotAI::UpdateInCombatAI_Hunter()
                     return;
             }
         }
-
-        if (!me->HasUnitState(UNIT_STATE_ROOT) &&
-            (me->GetCombatDistance(pVictim) < 8.0f) &&
-            (GetRole() != ROLE_MELEE_DPS) &&
-             me->GetMotionMaster()->GetCurrentMovementGeneratorType() != DISTANCING_MOTION_TYPE)
-        {
-            if (!me->IsStopped())
-                me->StopMoving();
-            me->GetMotionMaster()->Clear();
-            if (RunAwayFromTarget(pVictim))
-                return;
-        }
     }
 }
 
@@ -2764,6 +2865,8 @@ void PartyBotAI::UpdateInCombatAI_Mage()
         }
         else if (GetAttackersInRangeCount(10.0f))
         {
+            // Party bots never run away from what hits them (the tank comes for it); they
+            // shield or root it and keep casting.
             if (m_spells.mage.pManaShield &&
                (me->GetPowerPercent(POWER_MANA) > 20.0f) &&
                 CanTryToCastSpell(me, m_spells.mage.pManaShield))
@@ -2772,37 +2875,13 @@ void PartyBotAI::UpdateInCombatAI_Mage()
                     return;
             }
 
-            if ((GetRole() != ROLE_MELEE_DPS) &&
-                (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != DISTANCING_MOTION_TYPE))
+            if (m_spells.mage.pFrostNova &&
+               !pVictim->HasUnitState(UNIT_STATE_ROOT) &&
+               !pVictim->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) &&
+                CanTryToCastSpell(me, m_spells.mage.pFrostNova))
             {
-                if (m_spells.mage.pBlink &&
-                    (me->HasUnitState(UNIT_STATE_CAN_NOT_MOVE) ||
-                        me->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)) &&
-                    CanTryToCastSpell(me, m_spells.mage.pBlink))
-                {
-                    if (me->GetMotionMaster()->GetCurrentMovementGeneratorType())
-                        me->GetMotionMaster()->Clear();
-
-                    if (DoCastSpell(me, m_spells.mage.pBlink) == SPELL_CAST_OK)
-                        return;
-                }
-
-                if (!me->HasUnitState(UNIT_STATE_CAN_NOT_MOVE))
-                {
-                    if (m_spells.mage.pFrostNova &&
-                       !pVictim->HasUnitState(UNIT_STATE_ROOT) &&
-                       !pVictim->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) &&
-                        CanTryToCastSpell(me, m_spells.mage.pFrostNova))
-                    {
-                        DoCastSpell(me, m_spells.mage.pFrostNova);
-                    }
-
-                    if (RunAwayFromTarget(pVictim))
-                    {
-                        me->SetCasterChaseDistance(25.0f);
-                        return;
-                    }
-                }
+                if (DoCastSpell(me, m_spells.mage.pFrostNova) == SPELL_CAST_OK)
+                    return;
             }
         }
 
@@ -2829,9 +2908,6 @@ void PartyBotAI::UpdateInCombatAI_Mage()
                     return;
             }
         }
-
-        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == DISTANCING_MOTION_TYPE)
-            return;
 
         if (m_spells.mage.pCounterspell &&
             pVictim->IsNonMeleeSpellCasted(false, false, true) &&
@@ -3837,10 +3913,7 @@ void PartyBotAI::UpdateInCombatAI_Rogue()
                 if (CanTryToCastSpell(me, m_spells.rogue.pVanish))
                 {
                     if (DoCastSpell(me, m_spells.rogue.pVanish) == SPELL_CAST_OK)
-                    {
-                        if (RunAwayFromTarget(pVictim))
-                            return;
-                    }
+                        return;
                 }
             }
         }
@@ -4365,19 +4438,15 @@ void PartyBotAI::UpdateInCombatAI_Druid()
                 BeginChasing(pVictim);
             }
             else if (pVictim->CanReachWithMeleeAutoAttack(me) &&
-                    (pVictim->GetVictim() == me) &&
-                    !me->HasUnitState(UNIT_STATE_ROOT) &&
-                    (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != DISTANCING_MOTION_TYPE))
+                    (pVictim->GetVictim() == me))
             {
+                // Rooted, not run from (party bots never run away; the tank comes for it).
                 if (m_spells.druid.pEntanglingRoots &&
                     CanTryToCastSpell(pVictim, m_spells.druid.pEntanglingRoots))
                 {
                     if (DoCastSpell(pVictim, m_spells.druid.pEntanglingRoots) == SPELL_CAST_OK)
                         return;
                 }
-                me->SetCasterChaseDistance(25.0f);
-                if (RunAwayFromTarget(pVictim))
-                    return;
             }
 
             if (m_spells.druid.pFaerieFire &&
@@ -4394,9 +4463,6 @@ void PartyBotAI::UpdateInCombatAI_Druid()
                 if (DoCastSpell(pVictim, m_spells.druid.pInsectSwarm) == SPELL_CAST_OK)
                     return;
             }
-
-            if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == DISTANCING_MOTION_TYPE)
-                return;
 
             if (m_spells.druid.pHurricane &&
                (me->GetEnemyCountInRadiusAround(pVictim, 10.0f) > 2) &&

@@ -3214,6 +3214,12 @@ AHBot.itemcount = 50
 #        A lower number equals to gear being more close to the bot level.
 #        Default: 10 (bots will equip gear down to a minimum of 10 item level difference)
 #
+#    PartyBot.UpdateInterval
+#        Milliseconds between two "thinking" updates of each party bot (target choice, spells,
+#        taunts). Lower = faster reactions, more server load. Commands and entering combat
+#        always wake a bot on the next world tick.
+#        Default: 500 (min 100, max 1000)
+#
 #    BattleBot.AutoEquip
 #        What gear will new battlebots spawn with.
 #        Default: 1 (random items)
@@ -3241,6 +3247,7 @@ PartyBot.MaxBots = 0
 PartyBot.SkipChecks = 0
 PartyBot.AutoEquip = 1
 PartyBot.RandomGearLevelDifference = 10
+PartyBot.UpdateInterval = 500
 
 BattleBot.AutoEquip = 1
 BattleBot.AutoJoin = 0

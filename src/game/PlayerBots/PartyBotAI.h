@@ -82,7 +82,8 @@ public:
     bool CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpellEntry) const final;
     Player* GetPartyLeader() const;
     bool AttackStart(Unit* pVictim);
-    Unit* SelectAttackTarget(Player* pLeader) const;
+    // reason: why this target (for the [Target] log line).
+    Unit* SelectAttackTarget(Player* pLeader, char const*& reason) const;
     Unit* SelectPartyAttackTarget() const;
     Player* SelectResurrectionTarget() const;
     Player* SelectShieldTarget() const;
@@ -90,9 +91,6 @@ public:
     bool CanUseCrowdControl(SpellEntry const* pSpellEntry, Unit* pTarget) const;
     bool DrinkAndEat();
     bool ShouldAutoRevive() const;
-    bool IsValidDistancingTarget(Unit* pTarget, Unit* pEnemy);
-    Unit* GetDistancingTarget(Unit* pEnemy);
-    bool RunAwayFromTarget(Unit* pEnemy);
     bool CrowdControlMarkedTargets();
     bool EnterCombatDruidForm();
     bool ShouldEnterStealth() const;
@@ -103,6 +101,10 @@ public:
     void WakeUp();
     char const* GetLayerName(PartyBotLayer layer) const;
     void OrderStay();
+    // Player's attack/pull order: leaves stay/hold and attacks; the target beats the skull and
+    // other marks (and may be a CC mark) until it dies or another order replaces it.
+    void OrderAttack(Unit* pTarget);
+    void ClearOrderedTarget();
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
     void OrderStackedFollow(bool stacked);
@@ -113,6 +115,7 @@ public:
     void ReactToLeaderMovement();
     void StandUpToFollow();
     void BreakActionsAndFollowNow();
+    void BreakCurrentActions();
     void FaceCombatTarget();
     void SetHoldPosition(bool hold);
     void SetHoldSpotHere();
@@ -130,7 +133,12 @@ public:
     PartyBotTankSlotMap const& GetTankSlots() const;
     static uint8 GetSlotOf(PartyBotTankSlotMap const& slots, Unit const* pUnit);
     uint8 GetHealPriority(Unit const* pUnit) const final;
-    Unit* GetFocusMarkTarget() const;
+    // Target that beats any other: the ordered target, else the skull, else other focus marks
+    // (marks only once they are fighting). reason: "ordered", "skull" or "focus mark".
+    Unit* GetPreferredTarget(char const*& reason) const;
+    Unit* GetFocusMarkTarget(char const*& reason) const;
+    // A mark given to any bot of the group with ccmark: no bot attacks it unless ordered to.
+    bool IsForbiddenTarget(Unit const* pTarget) const;
     Unit* SelectLooseEnemy(PartyBotTankSlotMap const& slots) const;
     bool TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks);
     bool UpdateTankDuty();
@@ -196,6 +204,7 @@ public:
     PartyBotFollowMode m_followMode = PB_FOLLOW_LOOSE;
     bool m_arrivedAtLeader = false;
     bool m_leaderWasMoving = false;
+    bool m_wasInCombat = false;
     bool m_returningToHoldSpot = false;
     uint32 m_returnProgressTime = 0;
     float m_returnBestDistance = 0.0f;
@@ -205,7 +214,9 @@ public:
     float m_holdZ = 0.0f;
     bool m_tankSlotManual = false;               // slot set by command (else automatic)
     uint8 m_tankSlotChoice = PB_TANK_SLOT_NONE;  // the manual slot
-    bool m_singleFocus = false;                  // tank only its focus mark, ignore loose enemies
+    bool m_singleFocus = false;                  // tank only: stays on its preferred target, ignores loose enemies
+    ObjectGuid m_orderedTargetGuid;              // target of the last attack/pull order
+    uint32 m_moveOrderTime = 0;                  // when the last move order came (for the reaction log)
     bool m_autoAoE = true;                       // damage dealers use area spells on big packs
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
     mutable PartyBotTankSlotMap m_tankSlotCache;
