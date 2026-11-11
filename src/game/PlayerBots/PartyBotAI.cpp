@@ -475,6 +475,9 @@ Player* PartyBotAI::SelectShieldTarget() const
     return nullptr;
 }
 
+// Crowd-controls the CC marks given to this bot (pull timer, in and out of combat). Out of spell
+// range or line of sight it first walks there (also off a stay spot). Never the target of its own
+// attack order. Returns true while it casts or walks for it.
 bool PartyBotAI::CrowdControlMarkedTargets()
 {
     SpellEntry const* pSpellEntry = GetCrowdControlSpell();
@@ -483,20 +486,53 @@ bool PartyBotAI::CrowdControlMarkedTargets()
 
     for (auto mark : m_marksToCC)
     {
-        if (Unit* pTarget = GetMarkedTarget(mark))
+        Unit* pTarget = GetMarkedTarget(mark);
+        if (!pTarget || pTarget->GetObjectGuid() == m_orderedTargetGuid ||
+            pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) ||
+            !IsValidHostileTarget(pTarget) || AreOthersOnSameTarget(pTarget->GetObjectGuid()))
+            continue;
+
+        float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
+        bool const inRange = me->IsWithinDistInMap(pTarget, range - 2.0f);
+        bool const inSight = me->IsWithinLOSInMap(pTarget);
+        if (!inRange || !inSight)
         {
-            if (!pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) &&
-                IsValidHostileTarget(pTarget) && !AreOthersOnSameTarget(pTarget->GetObjectGuid()))
+            // A point on the line to the target, well inside range (closer when sight is blocked).
+            // Chase movement cannot be used: it stops when the target is not the bot's victim.
+            float const wanted = inSight ? range - 8.0f : 5.0f;
+            float const distance = me->GetDistance(pTarget);
+            float const ratio = distance > wanted ? (distance - wanted) / distance : 0.0f;
+            float const x = me->GetPositionX() + (pTarget->GetPositionX() - me->GetPositionX()) * ratio;
+            float const y = me->GetPositionY() + (pTarget->GetPositionY() - me->GetPositionY()) * ratio;
+            float const z = me->GetPositionZ() + (pTarget->GetPositionZ() - me->GetPositionZ()) * ratio;
+
+            if (m_ccApproachGuid != pTarget->GetObjectGuid())
             {
-                if (CanTryToCastSpell(pTarget, pSpellEntry))
-                {
-                    if (DoCastSpell(pTarget, pSpellEntry) == SPELL_CAST_OK)
-                    {
-                        me->ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
-                        return true;
-                    }
-                }
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: walks into %s range of %s (%.0f yd away%s)",
+                    me->GetName(), pSpellEntry->SpellName[0].c_str(), pTarget->GetName(), distance,
+                    inSight ? "" : ", no line of sight");
+                m_ccApproachGuid = pTarget->GetObjectGuid();
+                if (m_holdPosition)
+                    SetHoldPosition(false);
             }
+            if (me->GetStandState() != UNIT_STAND_STATE_STAND)
+                me->SetStandState(UNIT_STAND_STATE_STAND);
+            me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+            return true;
+        }
+
+        if (m_ccApproachGuid == pTarget->GetObjectGuid())
+        {
+            m_ccApproachGuid.Clear();
+            me->StopMoving();
+            me->GetMotionMaster()->Clear(false, true);
+            me->GetMotionMaster()->MoveIdle();
+        }
+
+        if (CanTryToCastSpell(pTarget, pSpellEntry) && DoCastSpell(pTarget, pSpellEntry) == SPELL_CAST_OK)
+        {
+            me->ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
+            return true;
         }
     }
     return false;
@@ -1072,8 +1108,20 @@ void PartyBotAI::OrderStay()
     SetHoldPosition(true);
 }
 
-void PartyBotAI::OrderAttack(Unit* pTarget)
+void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC)
 {
+    EndPullWait("attack order");
+    m_orderedTargetGuid = pTarget->GetObjectGuid();
+    m_orderOverridesCC = overrideCC;
+    if (IsForbiddenTarget(pTarget))
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: will not pull %s (CC mark; use attack to override)",
+            me->GetName(), pTarget->GetName());
+        ClearOrderedTarget();
+        return;
+    }
+
+    BreakCurrentActions();
     if (m_holdPosition)
     {
         // After the fight the bot follows the leader again (it does not return to the spot).
@@ -1081,8 +1129,6 @@ void PartyBotAI::OrderAttack(Unit* pTarget)
         SetHoldPosition(false);
     }
 
-    EndPullWait("attack order");
-    m_orderedTargetGuid = pTarget->GetObjectGuid();
     if (me->GetVictim() && me->GetVictim() != pTarget)
         me->AttackStop(true);
     AttackStart(pTarget);
@@ -1091,12 +1137,15 @@ void PartyBotAI::OrderAttack(Unit* pTarget)
 void PartyBotAI::ClearOrderedTarget()
 {
     m_orderedTargetGuid.Clear();
+    m_orderOverridesCC = false;
 }
 
 void PartyBotAI::StartPullWait(uint32 duration)
 {
     m_pullWaitStart = WorldTimer::getMSTime();
     m_pullWaitDuration = duration;
+    m_ccApproachGuid.Clear();
+    BreakCurrentActions();
     me->StopMoving();
     me->GetMotionMaster()->Clear(false, true);
     me->GetMotionMaster()->MoveIdle();
@@ -1111,43 +1160,12 @@ void PartyBotAI::EndPullWait(char const* why)
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: stops waiting (%s)", me->GetName(), why);
 }
 
-// While the pull timer runs: crowd-control the CC marks given to this bot (walking into spell
-// range and line of sight first, also off a stay spot), otherwise stand still.
+// While the pull timer runs: crowd-control this bot's CC marks (walking there first), otherwise
+// stand still.
 void PartyBotAI::UpdatePullWait()
 {
-    SpellEntry const* pSpellEntry = GetCrowdControlSpell();
-    for (auto mark : m_marksToCC)
-    {
-        Unit* pTarget = pSpellEntry ? GetMarkedTarget(mark) : nullptr;
-        if (!pTarget || !IsValidHostileTarget(pTarget) ||
-            pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
-            continue;
-
-        float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
-        if (!me->IsWithinDistInMap(pTarget, range - 2.0f) || !me->IsWithinLOSInMap(pTarget))
-        {
-            if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
-            {
-                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: moves into %s range of %s (CC mark)",
-                    me->GetName(), pSpellEntry->SpellName[0].c_str(), pTarget->GetName());
-                if (m_holdPosition)
-                    SetHoldPosition(false);
-                me->GetMotionMaster()->MoveChase(pTarget, range * 0.6f);
-            }
-            return;
-        }
-
-        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
-        {
-            me->StopMoving();
-            me->GetMotionMaster()->Clear(false, true);
-            me->GetMotionMaster()->MoveIdle();
-        }
-
-        if (CanTryToCastSpell(pTarget, pSpellEntry))
-            DoCastSpell(pTarget, pSpellEntry);
+    if (CrowdControlMarkedTargets())
         return;
-    }
 
     if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != IDLE_MOTION_TYPE)
     {
@@ -1195,6 +1213,8 @@ void PartyBotAI::OrderStackedFollow(bool stacked)
     SetFollowMode(stacked ? PB_FOLLOW_STACKED : PB_FOLLOW_LOOSE);
     if (stacked)
         BreakActionsAndFollowNow();
+    else
+        BreakCurrentActions();
 }
 
 // Movement orders win over whatever the bot is doing: stop casting (also channels), eating and
@@ -1210,6 +1230,8 @@ void PartyBotAI::BreakCurrentActions()
     if (pSpell)
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Order] %s: stops casting %s for the order", me->GetName(),
             pSpell->m_spellInfo->SpellName[0].c_str());
+    if (me->HasAura(PB_SPELL_FOOD) || me->HasAura(PB_SPELL_DRINK))
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Order] %s: stops eating/drinking for the order", me->GetName());
 
     me->InterruptNonMeleeSpells(false);
     me->RemoveAurasDueToSpell(PB_SPELL_FOOD);
@@ -1795,7 +1817,7 @@ Unit* PartyBotAI::GetPreferredTarget(char const*& reason) const
 {
     if (!m_orderedTargetGuid.IsEmpty())
         if (Unit* pOrdered = me->GetMap()->GetUnit(m_orderedTargetGuid))
-            if (IsValidHostileTarget(pOrdered))
+            if (IsValidHostileTarget(pOrdered) && !IsForbiddenTarget(pOrdered))
             {
                 reason = "ordered";
                 return pOrdered;
@@ -1837,7 +1859,7 @@ Unit* PartyBotAI::GetFocusMarkTarget(char const*& reason) const
 
 bool PartyBotAI::IsForbiddenTarget(Unit const* pTarget) const
 {
-    if (pTarget->GetObjectGuid() == m_orderedTargetGuid)
+    if (m_orderOverridesCC && pTarget->GetObjectGuid() == m_orderedTargetGuid)
         return false;
 
     Group* pGroup = me->GetGroup();

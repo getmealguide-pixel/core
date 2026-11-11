@@ -1462,7 +1462,7 @@ bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
                 {
                     if (pAI->GetRole() != ROLE_HEALER && pMember->IsValidAttackTarget(pTarget))
                     {
-                        pAI->OrderAttack(pTarget);
+                        pAI->OrderAttack(pTarget, true);
                         attackers += attackers.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
                     }
                 }
@@ -2333,7 +2333,7 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
                     {
                         if (pMember->IsValidAttackTarget(pTarget))
                         {
-                            pAI->OrderAttack(pTarget);
+                            pAI->OrderAttack(pTarget, false);
                             tanks += tanks.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
                         }
                     }

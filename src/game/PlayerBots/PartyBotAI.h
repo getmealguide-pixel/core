@@ -102,8 +102,9 @@ public:
     char const* GetLayerName(PartyBotLayer layer) const;
     void OrderStay();
     // Player's attack/pull order: leaves stay/hold and attacks; the target beats the skull and
-    // other marks (and may be a CC mark) until it dies or another order replaces it.
-    void OrderAttack(Unit* pTarget);
+    // other marks until it dies or another order replaces it. overrideCC (attack, not pull): the
+    // target may be a CC mark (the bot's own CC duty then skips it too).
+    void OrderAttack(Unit* pTarget, bool overrideCC);
     void ClearOrderedTarget();
     // Pull timer for damage dealers: they hold still until it ends; a bot with a CC mark first
     // walks into range of the marked enemy and crowd-controls it. Any new order ends the wait.
@@ -225,6 +226,8 @@ public:
     uint32 m_moveOrderTime = 0;                  // when the last move order came (for the reaction log)
     uint32 m_pullWaitStart = 0;                  // pull timer start (ms)
     uint32 m_pullWaitDuration = 0;               // pull timer length (ms), 0 = not waiting
+    ObjectGuid m_ccApproachGuid;                 // CC mark this bot is walking towards
+    bool m_orderOverridesCC = false;             // attack order (not pull) may hit a CC mark
     bool m_autoAoE = true;                       // damage dealers use area spells on big packs
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
     mutable PartyBotTankSlotMap m_tankSlotCache;
