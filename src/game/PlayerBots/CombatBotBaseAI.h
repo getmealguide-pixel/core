@@ -136,7 +136,7 @@ public:
 
     void EquipOrUseNewItem();
     void AddItemToInventory(uint32 itemId, uint32 count = 1);
-    void AddHunterAmmo();
+    void AddRangedAmmo(); // arrows/bullets for the equipped bow, gun or crossbow
     uint8 GetHighestHonorRankFromEquippedItems() const;
     void UpdateVisualHonorRankBasedOnItems();
     void BeginChasing(Unit* pVictim) const;

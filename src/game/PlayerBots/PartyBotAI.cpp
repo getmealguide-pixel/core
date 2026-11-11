@@ -43,6 +43,10 @@ enum PartyBotSpells
     PB_SPELL_DRINK = 1137,
     PB_SPELL_AUTO_SHOT = 75,
     PB_SPELL_SHOOT_WAND = 5019,
+    PB_SPELL_SHOOT_BOW = 2480,
+    PB_SPELL_SHOOT_GUN = 7918,
+    PB_SPELL_SHOOT_CROSSBOW = 7919,
+    PB_SPELL_THROW = 2764,
     PB_SPELL_HONORLESS_TARGET = 2479,
 };
 
@@ -51,6 +55,8 @@ enum PartyBotSpells
 #define PB_MIN_FOLLOW_ANGLE 0.0f
 #define PB_MAX_FOLLOW_ANGLE 6.0f
 #define PB_STACK_DIST 1.5f
+#define PB_RANGED_PULL_WAIT (6 * IN_MILLISECONDS)     // rpull: wait this long after the shot for the target
+#define PB_RANGED_PULL_TIMEOUT (10 * IN_MILLISECONDS) // rpull: melee pull if no shot left by then
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
@@ -475,6 +481,90 @@ Player* PartyBotAI::SelectShieldTarget() const
     return nullptr;
 }
 
+bool PartyBotAI::WalkIntoRange(Unit* pTarget, float range, char const* tag, char const* what)
+{
+    bool const inRange = me->IsWithinDistInMap(pTarget, range - 2.0f);
+    bool const inSight = me->IsWithinLOSInMap(pTarget);
+    if (inRange && inSight)
+    {
+        if (m_approachGuid == pTarget->GetObjectGuid())
+        {
+            m_approachGuid.Clear();
+            me->StopMoving();
+            me->GetMotionMaster()->Clear(false, true);
+            me->GetMotionMaster()->MoveIdle();
+        }
+        return false;
+    }
+
+    // A point on the line to the target, well inside range (closer when sight is blocked).
+    // Chase movement cannot be used: it stops when the target is not the bot's victim.
+    float const wanted = inSight ? range - 8.0f : 5.0f;
+    float const distance = me->GetDistance(pTarget);
+    float const ratio = distance > wanted ? (distance - wanted) / distance : 0.0f;
+    float const x = me->GetPositionX() + (pTarget->GetPositionX() - me->GetPositionX()) * ratio;
+    float const y = me->GetPositionY() + (pTarget->GetPositionY() - me->GetPositionY()) * ratio;
+    float const z = me->GetPositionZ() + (pTarget->GetPositionZ() - me->GetPositionZ()) * ratio;
+
+    if (m_approachGuid != pTarget->GetObjectGuid())
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[%s] %s: walks into %s range of %s (%.0f yd away%s)", tag,
+            me->GetName(), what, pTarget->GetName(), distance, inSight ? "" : ", no line of sight");
+        m_approachGuid = pTarget->GetObjectGuid();
+        if (m_holdPosition)
+            SetHoldPosition(false);
+    }
+    if (me->GetStandState() != UNIT_STAND_STATE_STAND)
+        me->SetStandState(UNIT_STAND_STATE_STAND);
+    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+    return true;
+}
+
+SpellEntry const* PartyBotAI::GetRangedWeaponSpell()
+{
+    if (me->GetClass() == CLASS_HUNTER) // Auto Shot
+        return nullptr;
+
+    Item* pWeapon = me->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    ItemPrototype const* pProto = pWeapon ? pWeapon->GetProto() : nullptr;
+    if (!pProto || pProto->Class != ITEM_CLASS_WEAPON)
+        return nullptr;
+
+    uint32 spellId;
+    switch (pProto->SubClass)
+    {
+        case ITEM_SUBCLASS_WEAPON_BOW:      spellId = PB_SPELL_SHOOT_BOW;      break;
+        case ITEM_SUBCLASS_WEAPON_GUN:      spellId = PB_SPELL_SHOOT_GUN;      break;
+        case ITEM_SUBCLASS_WEAPON_CROSSBOW: spellId = PB_SPELL_SHOOT_CROSSBOW; break;
+        case ITEM_SUBCLASS_WEAPON_THROWN:   spellId = PB_SPELL_THROW;          break;
+        default:                            return nullptr; // wands: casters use Shoot themselves
+    }
+
+    // A player learns these with the weapon skill at the trainer.
+    if (!me->HasSpell(spellId))
+    {
+        me->LearnSpell(spellId, false);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Shoot] %s: learns spell %u for %s", me->GetName(), spellId,
+            pProto->Name1);
+    }
+    return sSpellMgr.GetSpellEntry(spellId);
+}
+
+bool PartyBotAI::ShootRangedWeapon(Unit* pTarget)
+{
+    SpellEntry const* pSpellEntry = GetRangedWeaponSpell();
+    if (!pSpellEntry || !CanTryToCastSpell(pTarget, pSpellEntry) || !me->IsWithinLOSInMap(pTarget))
+        return false;
+
+    SpellCastResult result = DoCastSpell(pTarget, pSpellEntry);
+    if (result == SPELL_FAILED_NEED_AMMO || result == SPELL_FAILED_NO_AMMO)
+    {
+        AddRangedAmmo();
+        result = DoCastSpell(pTarget, pSpellEntry);
+    }
+    return result == SPELL_CAST_OK;
+}
+
 // Crowd-controls the CC marks given to this bot (pull timer, in and out of combat). Out of spell
 // range or line of sight it first walks there (also off a stay spot). Never the target of its own
 // attack order. Returns true while it casts or walks for it.
@@ -493,41 +583,8 @@ bool PartyBotAI::CrowdControlMarkedTargets()
             continue;
 
         float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
-        bool const inRange = me->IsWithinDistInMap(pTarget, range - 2.0f);
-        bool const inSight = me->IsWithinLOSInMap(pTarget);
-        if (!inRange || !inSight)
-        {
-            // A point on the line to the target, well inside range (closer when sight is blocked).
-            // Chase movement cannot be used: it stops when the target is not the bot's victim.
-            float const wanted = inSight ? range - 8.0f : 5.0f;
-            float const distance = me->GetDistance(pTarget);
-            float const ratio = distance > wanted ? (distance - wanted) / distance : 0.0f;
-            float const x = me->GetPositionX() + (pTarget->GetPositionX() - me->GetPositionX()) * ratio;
-            float const y = me->GetPositionY() + (pTarget->GetPositionY() - me->GetPositionY()) * ratio;
-            float const z = me->GetPositionZ() + (pTarget->GetPositionZ() - me->GetPositionZ()) * ratio;
-
-            if (m_ccApproachGuid != pTarget->GetObjectGuid())
-            {
-                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: walks into %s range of %s (%.0f yd away%s)",
-                    me->GetName(), pSpellEntry->SpellName[0].c_str(), pTarget->GetName(), distance,
-                    inSight ? "" : ", no line of sight");
-                m_ccApproachGuid = pTarget->GetObjectGuid();
-                if (m_holdPosition)
-                    SetHoldPosition(false);
-            }
-            if (me->GetStandState() != UNIT_STAND_STATE_STAND)
-                me->SetStandState(UNIT_STAND_STATE_STAND);
-            me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+        if (WalkIntoRange(pTarget, range, "CC", pSpellEntry->SpellName[0].c_str()))
             return true;
-        }
-
-        if (m_ccApproachGuid == pTarget->GetObjectGuid())
-        {
-            m_ccApproachGuid.Clear();
-            me->StopMoving();
-            me->GetMotionMaster()->Clear(false, true);
-            me->GetMotionMaster()->MoveIdle();
-        }
 
         if (CanTryToCastSpell(pTarget, pSpellEntry) && DoCastSpell(pTarget, pSpellEntry) == SPELL_CAST_OK)
         {
@@ -842,6 +899,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     if (me->IsNonMeleeSpellCasted(false, false, true))
         return;
 
+    if (!m_rangedPullGuid.IsEmpty() && UpdateRangedPull())
+        return;
+
     if (IsPullWaiting())
     {
         if (WorldTimer::getMSTimeDiffToNow(m_pullWaitStart) >= m_pullWaitDuration)
@@ -1108,7 +1168,7 @@ void PartyBotAI::OrderStay()
     SetHoldPosition(true);
 }
 
-void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC)
+void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
 {
     EndPullWait("attack order");
     m_orderedTargetGuid = pTarget->GetObjectGuid();
@@ -1129,6 +1189,26 @@ void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC)
         SetHoldPosition(false);
     }
 
+    m_rangedPullGuid.Clear();
+    if (ranged)
+    {
+        if (GetRangedWeaponSpell())
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: ranged pull on %s", me->GetName(), pTarget->GetName());
+            m_rangedPullGuid = pTarget->GetObjectGuid();
+            m_rangedPullStart = WorldTimer::getMSTime();
+            m_rangedPullShotTime = 0;
+            if (me->GetVictim())
+                me->AttackStop(true);
+            me->StopMoving();
+            me->GetMotionMaster()->Clear(false, true);
+            me->GetMotionMaster()->MoveIdle();
+            return;
+        }
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: no ranged weapon, pulls %s in melee", me->GetName(),
+            pTarget->GetName());
+    }
+
     if (me->GetVictim() && me->GetVictim() != pTarget)
         me->AttackStop(true);
     AttackStart(pTarget);
@@ -1138,13 +1218,75 @@ void PartyBotAI::ClearOrderedTarget()
 {
     m_orderedTargetGuid.Clear();
     m_orderOverridesCC = false;
+    m_rangedPullGuid.Clear();
+}
+
+// Ranged pull (tank): walk into shooting range, shoot the target, then wait on the spot until it
+// reaches melee (or PB_RANGED_PULL_WAIT after the shot), then tank as usual. Returns true while busy.
+bool PartyBotAI::UpdateRangedPull()
+{
+    Unit* pTarget = me->GetMap()->GetUnit(m_rangedPullGuid);
+    if (!pTarget || !pTarget->IsAlive() || !IsValidHostileTarget(pTarget))
+    {
+        EndRangedPull("target gone");
+        return false;
+    }
+
+    if (m_rangedPullShotTime)
+    {
+        if (me->CanReachWithMeleeAutoAttack(pTarget))
+            EndRangedPull("target arrived");
+        else if (WorldTimer::getMSTimeDiffToNow(m_rangedPullShotTime) > PB_RANGED_PULL_WAIT)
+            EndRangedPull("target did not come");
+        else
+            return true;
+        return false;
+    }
+
+    SpellEntry const* pShot = GetRangedWeaponSpell();
+    SpellRangeEntry const* pRange = pShot ? sSpellRangeStore.LookupEntry(pShot->rangeIndex) : nullptr;
+    if (!pRange)
+    {
+        EndRangedPull("no ranged weapon");
+        return false;
+    }
+    if (WorldTimer::getMSTimeDiffToNow(m_rangedPullStart) > PB_RANGED_PULL_TIMEOUT)
+    {
+        EndRangedPull("could not shoot in time");
+        return false;
+    }
+    if (me->GetCombatDistance(pTarget) < pRange->minRange)
+    {
+        EndRangedPull("too close to shoot");
+        return false;
+    }
+
+    if (WalkIntoRange(pTarget, Spells::GetSpellMaxRange(pRange), "Pull", pShot->SpellName[0].c_str()))
+        return true;
+
+    if (ShootRangedWeapon(pTarget))
+    {
+        m_rangedPullShotTime = WorldTimer::getMSTime();
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: shot %s, waiting for it", me->GetName(), pTarget->GetName());
+    }
+    return true;
+}
+
+// Ends the ranged pull; the tank then attacks the pulled target (still its ordered target).
+void PartyBotAI::EndRangedPull(char const* why)
+{
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: ranged pull over (%s)", me->GetName(), why);
+    Unit* pTarget = me->GetMap()->GetUnit(m_rangedPullGuid);
+    m_rangedPullGuid.Clear();
+    if (pTarget && pTarget->IsAlive() && IsValidHostileTarget(pTarget))
+        AttackStart(pTarget);
 }
 
 void PartyBotAI::StartPullWait(uint32 duration)
 {
     m_pullWaitStart = WorldTimer::getMSTime();
     m_pullWaitDuration = duration;
-    m_ccApproachGuid.Clear();
+    m_approachGuid.Clear();
     BreakCurrentActions();
     me->StopMoving();
     me->GetMotionMaster()->Clear(false, true);
@@ -1345,7 +1487,8 @@ void PartyBotAI::ReactToLeaderMovement()
 
     // Not while paused (an active pause keeps the update timer longer than one interval) or
     // waiting for a pull timer.
-    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > GetUpdateInterval() || IsPullWaiting())
+    if (!startedMoving || !me->IsAlive() || m_updateTimer.GetExpiry() > GetUpdateInterval() || IsPullWaiting() ||
+        !m_rangedPullGuid.IsEmpty())
         return;
 
     if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
@@ -2164,6 +2307,13 @@ void PartyBotAI::UpdateInCombatAI()
     if (CheckForDispelTargets())
         return;
 
+    // Melee and tanks that may not move (stay, move-here spot, toggle): an enemy out of melee
+    // reach is shot with the ranged weapon (bow, gun, crossbow, thrown) instead.
+    if (!CanMoveOnOwn() && (m_role == ROLE_MELEE_DPS || m_role == ROLE_TANK))
+        if (Unit* pVictim = me->GetVictim())
+            if (!me->CanReachWithMeleeAutoAttack(pVictim) && ShootRangedWeapon(pVictim))
+                return;
+
     // Auto AoE: damage dealers on a pack of more than 3 enemies (CC marks and not-yet-pulled
     // mobs are still protected by CanTryToCastSpell).
     if (m_autoAoE && !IsInDuel() && (m_role == ROLE_MELEE_DPS || m_role == ROLE_RANGE_DPS))
@@ -2778,7 +2928,7 @@ void PartyBotAI::UpdateInCombatAI_Hunter()
                 case SPELL_FAILED_NEED_AMMO:
                 case SPELL_FAILED_NO_AMMO:
                 {
-                    AddHunterAmmo();
+                    AddRangedAmmo();
                     break;
                 }
             }

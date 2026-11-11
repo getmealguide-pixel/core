@@ -3279,7 +3279,7 @@ void CombatBotBaseAI::AddItemToInventory(uint32 itemId, uint32 count)
     }
 }
 
-void CombatBotBaseAI::AddHunterAmmo()
+void CombatBotBaseAI::AddRangedAmmo()
 {
     if (Item* pWeapon = me->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED))
     {

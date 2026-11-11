@@ -104,6 +104,7 @@ ChatCommand * ChatHandler::getCommandTable()
         { "attackstart",SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotAttackStartCommand, "", nullptr },
         { "attackstop", SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotAttackStopCommand,  "", nullptr },
         { "pull",       SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotPullCommand,        "", nullptr },
+        { "rpull",      SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotRangedPullCommand,  "", nullptr },
         { "aoe",        SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotAoECommand,         "", nullptr },
         { "caststart",  SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotStartCastingCommand, "", nullptr },
         { "caststop",   SEC_ADMINISTRATOR,      false, &ChatHandler::HandlePartyBotStopCastingCommand, "", nullptr },

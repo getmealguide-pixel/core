@@ -2288,6 +2288,17 @@ bool ChatHandler::HandlePartyBotMoveToCommand(char* args)
 
 bool ChatHandler::HandlePartyBotPullCommand(char* args)
 {
+    return HandlePartyBotPullHelper(args, false);
+}
+
+// .partybot rpull [seconds]: like pull, but the tank shoots the target and waits for it.
+bool ChatHandler::HandlePartyBotRangedPullCommand(char* args)
+{
+    return HandlePartyBotPullHelper(args, true);
+}
+
+bool ChatHandler::HandlePartyBotPullHelper(char* args, bool ranged)
+{
     Player* pPlayer = GetSession()->GetPlayer();
     Unit* pTarget = GetSelectedUnit();
     if (!pTarget || !pPlayer->IsValidAttackTarget(pTarget, true))
@@ -2333,7 +2344,7 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
                     {
                         if (pMember->IsValidAttackTarget(pTarget))
                         {
-                            pAI->OrderAttack(pTarget, false);
+                            pAI->OrderAttack(pTarget, false, ranged);
                             tanks += tanks.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
                         }
                     }
@@ -2342,9 +2353,11 @@ bool ChatHandler::HandlePartyBotPullCommand(char* args)
         }
     }
 
-    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: pull %s, tank %s, DPS paused %u s: %s", pPlayer->GetName(),
-        pTarget->GetName(), tanks.empty() ? "none" : tanks.c_str(), seconds, paused.empty() ? "none" : paused.c_str());
-    PSendSysMessage("Tank party bots are pulling %s, DPS party bots are paused for %u seconds.", pTarget->GetName(), seconds);
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: %s %s, tank %s, DPS paused %u s: %s", pPlayer->GetName(),
+        ranged ? "ranged pull" : "pull", pTarget->GetName(), tanks.empty() ? "none" : tanks.c_str(), seconds,
+        paused.empty() ? "none" : paused.c_str());
+    PSendSysMessage("Tank party bots are %s %s, DPS party bots are paused for %u seconds.",
+        ranged ? "shooting to pull" : "pulling", pTarget->GetName(), seconds);
     return true;
 }
 

@@ -1631,7 +1631,7 @@ void BattleBotAI::UpdateInCombatAI_Hunter()
                 case SPELL_FAILED_NEED_AMMO:
                 case SPELL_FAILED_NO_AMMO:
                 {
-                    AddHunterAmmo();
+                    AddRangedAmmo();
                     break;
                 }
             }
