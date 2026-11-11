@@ -322,7 +322,7 @@ public:
         switch (me->GetClass())
         {
             case CLASS_PALADIN:
-                return m_spells.paladin.pHammerOfJustice;
+                return m_spells.paladin.pTurnUndead;
             case CLASS_MAGE:
                 return m_spells.mage.pPolymorph;
             case CLASS_PRIEST:
@@ -367,7 +367,7 @@ public:
             SpellEntry const* pHolyShock;
             SpellEntry const* pDivineFavor;
             SpellEntry const* pHolyWrath;
-            SpellEntry const* pTurnEvil;
+            SpellEntry const* pTurnUndead;
             SpellEntry const* pHolyShield;
         } paladin;
         struct

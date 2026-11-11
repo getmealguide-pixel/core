@@ -162,8 +162,19 @@ public:
     // (marks only once they are fighting). reason: "ordered", "skull" or "focus mark".
     Unit* GetPreferredTarget(char const*& reason) const;
     Unit* GetFocusMarkTarget(char const*& reason) const;
-    // A mark given to any bot of the group with ccmark: no bot attacks it unless ordered to.
+    // A mark given to any bot of the group with ccmark: no bot attacks it unless ordered to, or
+    // unless every bot holding the mark released it (could not crowd-control that enemy).
     bool IsForbiddenTarget(Unit const* pTarget) const;
+    // Automatic CC mark per CC-capable bot (one fixed mark per class). reset: all CC marks are
+    // handed out fresh (.partybot mark); otherwise manual ccmark assignments are kept. Announced
+    // in party chat and logged when the assignment changed (always on reset).
+    static void AssignCCMarks(Player* pLeader, bool reset, char const* why);
+    bool HasCrowdControlSpell() const;
+    SpellEntry const* GetCrowdControlSpellFor(Unit const* pTarget) const;
+    // The bot cannot crowd-control this enemy (creature type or immunity): it says so once in
+    // party chat and the enemy is attacked normally.
+    void ReleaseCCMark(Unit* pTarget, SpellEntry const* pSpellEntry, char const* why);
+    void SayInParty(std::string const& text) const;
     Unit* SelectLooseEnemy(PartyBotTankSlotMap const& slots) const;
     bool TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks);
     bool UpdateTankDuty();
@@ -216,6 +227,8 @@ public:
     void UpdateOutOfCombatAI_Druid() final;
 
     std::vector<RaidTargetIcon> m_marksToCC;
+    bool m_ccMarksAuto = false;                  // m_marksToCC was handed out by AssignCCMarks
+    std::set<ObjectGuid> m_releasedCC;           // CC-marked enemies this bot could not crowd-control
     std::vector<RaidTargetIcon> m_marksToFocus;
     ShortTimeTracker m_updateTimer;
     ObjectGuid m_leaderGuid;

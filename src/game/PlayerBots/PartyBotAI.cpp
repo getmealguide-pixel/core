@@ -578,31 +578,213 @@ bool PartyBotAI::ShootRangedWeapon(Unit* pTarget)
 // Crowd-controls the CC marks given to this bot (pull timer, in and out of combat). Out of spell
 // range or line of sight it first walks there (also off a stay spot). Never the target of its own
 // attack order. Returns true while it casts or walks for it.
-bool PartyBotAI::CrowdControlMarkedTargets()
+static char const* GetCreatureTypeName(uint32 creatureType)
+{
+    switch (creatureType)
+    {
+        case CREATURE_TYPE_BEAST:      return "beast";
+        case CREATURE_TYPE_DRAGONKIN:  return "dragonkin";
+        case CREATURE_TYPE_DEMON:      return "demon";
+        case CREATURE_TYPE_ELEMENTAL:  return "elemental";
+        case CREATURE_TYPE_GIANT:      return "giant";
+        case CREATURE_TYPE_UNDEAD:     return "undead";
+        case CREATURE_TYPE_HUMANOID:   return "humanoid";
+        case CREATURE_TYPE_CRITTER:    return "critter";
+        case CREATURE_TYPE_MECHANICAL: return "mechanical";
+    }
+    return "wrong creature type";
+}
+
+bool PartyBotAI::HasCrowdControlSpell() const
+{
+    return GetCrowdControlSpell() || (me->GetClass() == CLASS_WARLOCK && m_spells.warlock.pFear);
+}
+
+// The class CC spell; a warlock fears what it cannot banish (not a demon or elemental, or no
+// Banish yet).
+SpellEntry const* PartyBotAI::GetCrowdControlSpellFor(Unit const* pTarget) const
 {
     SpellEntry const* pSpellEntry = GetCrowdControlSpell();
-    if (!pSpellEntry)
+    if (me->GetClass() == CLASS_WARLOCK && m_spells.warlock.pFear &&
+        (!pSpellEntry || (pSpellEntry->TargetCreatureType &&
+                         !(pSpellEntry->TargetCreatureType & pTarget->GetCreatureTypeMask()))))
+        return m_spells.warlock.pFear;
+    return pSpellEntry;
+}
+
+bool PartyBotAI::CrowdControlMarkedTargets()
+{
+    if (!HasCrowdControlSpell())
         return false;
 
     for (auto mark : m_marksToCC)
     {
         Unit* pTarget = GetMarkedTarget(mark);
         if (!pTarget || pTarget->GetObjectGuid() == m_orderedTargetGuid ||
+            m_releasedCC.count(pTarget->GetObjectGuid()) ||
             pTarget->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL) ||
             !IsValidHostileTarget(pTarget) || AreOthersOnSameTarget(pTarget->GetObjectGuid()))
             continue;
+
+        SpellEntry const* pSpellEntry = GetCrowdControlSpellFor(pTarget);
+        if (!pSpellEntry)
+            continue;
+
+        // Wrong creature type or immune: release the mark instead of trying forever.
+        if (pSpellEntry->TargetCreatureType && !(pSpellEntry->TargetCreatureType & pTarget->GetCreatureTypeMask()))
+        {
+            ReleaseCCMark(pTarget, pSpellEntry, GetCreatureTypeName(pTarget->GetCreatureType()));
+            continue;
+        }
+        if (pTarget->IsImmuneToSpell(pSpellEntry, false) ||
+           (pSpellEntry->Mechanic && pTarget->IsImmuneToMechanic(Mechanics(pSpellEntry->Mechanic))))
+        {
+            ReleaseCCMark(pTarget, pSpellEntry, "immune");
+            continue;
+        }
 
         float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
         if (WalkIntoRange(pTarget, range, "CC", pSpellEntry->SpellName[0].c_str()))
             return true;
 
-        if (CanTryToCastSpell(pTarget, pSpellEntry) && DoCastSpell(pTarget, pSpellEntry) == SPELL_CAST_OK)
+        if (!CanTryToCastSpell(pTarget, pSpellEntry))
+            continue;
+
+        SpellCastResult const result = DoCastSpell(pTarget, pSpellEntry);
+        if (result == SPELL_CAST_OK)
         {
             me->ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
             return true;
         }
+        if (result == SPELL_FAILED_BAD_TARGETS || result == SPELL_FAILED_IMMUNE || result == SPELL_FAILED_HIGHLEVEL)
+            ReleaseCCMark(pTarget, pSpellEntry, result == SPELL_FAILED_HIGHLEVEL ? "level too high" : "not a valid target");
     }
     return false;
+}
+
+void PartyBotAI::ReleaseCCMark(Unit* pTarget, SpellEntry const* pSpellEntry, char const* why)
+{
+    if (!m_releasedCC.insert(pTarget->GetObjectGuid()).second)
+        return;
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: cannot %s %s (%s), mark released, attacked normally",
+        me->GetName(), pSpellEntry->SpellName[0].c_str(), pTarget->GetName(), why);
+    SayInParty(std::string("Can't ") + pSpellEntry->SpellName[0] + " " + pTarget->GetName() + " (" + why +
+        ") - attacking it instead.");
+}
+
+void PartyBotAI::SayInParty(std::string const& text) const
+{
+    Group* pGroup = me->GetGroup();
+    if (!pGroup)
+        return;
+
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_PARTY, text.c_str(), LANG_UNIVERSAL, CHAT_TAG_NONE,
+        me->GetObjectGuid(), me->GetName());
+    pGroup->BroadcastPacket(&data, false);
+}
+
+static char const* GetRaidIconName(RaidTargetIcon icon)
+{
+    static char const* const names[TARGET_ICON_COUNT] =
+        { "star", "circle", "diamond", "triangle", "moon", "square", "cross", "skull" };
+    return icon < TARGET_ICON_COUNT ? names[icon] : "?";
+}
+
+// "moon = Ade (Polymorph), triangle = Ki (Shackle Undead, manual)"; empty if no bot has a CC mark.
+static std::string DescribeCCMarks(std::vector<PartyBotAI*> const& bots)
+{
+    std::string text;
+    for (PartyBotAI const* pAI : bots)
+    {
+        SpellEntry const* pSpell = pAI->GetCrowdControlSpell();
+        std::string spellName = pSpell ? pSpell->SpellName[0] : std::string("no CC spell");
+        if (pAI->me->GetClass() == CLASS_WARLOCK && pAI->m_spells.warlock.pFear)
+            spellName = pSpell ? spellName + ", else Fear" : std::string("Fear");
+        for (auto mark : pAI->m_marksToCC)
+        {
+            text += text.empty() ? "" : ", ";
+            text += std::string(GetRaidIconName(mark)) + " = " + pAI->me->GetName() + " (" +
+                spellName + (pAI->m_ccMarksAuto ? ")" : ", manual)");
+        }
+    }
+    return text;
+}
+
+void PartyBotAI::AssignCCMarks(Player* pLeader, bool reset, char const* why)
+{
+    Group* pGroup = pLeader ? pLeader->GetGroup() : nullptr;
+    if (!pGroup)
+        return;
+
+    std::vector<PartyBotAI*> bots;
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+        if (Player* pMember = itr->getSource())
+            if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (pAI->m_initialized)
+                    bots.push_back(pAI);
+
+    std::string const before = DescribeCCMarks(bots);
+
+    // Manual assignments stay (and keep their marks) unless reset; automatic ones are redone.
+    std::set<RaidTargetIcon> taken;
+    for (PartyBotAI* pAI : bots)
+    {
+        if (reset || pAI->m_ccMarksAuto)
+        {
+            pAI->m_marksToCC.clear();
+            pAI->m_ccMarksAuto = false;
+        }
+        if (reset)
+            pAI->m_releasedCC.clear();
+        taken.insert(pAI->m_marksToCC.begin(), pAI->m_marksToCC.end());
+    }
+
+    // One fixed mark per class; another bot of the same class takes the next free spare mark.
+    static std::pair<uint8, RaidTargetIcon> const classMarks[] =
+    {
+        { CLASS_MAGE,    RAID_TARGET_ICON_MOON },
+        { CLASS_PRIEST,  RAID_TARGET_ICON_TRIANGLE },
+        { CLASS_WARLOCK, RAID_TARGET_ICON_DIAMOND },
+        { CLASS_ROGUE,   RAID_TARGET_ICON_STAR },
+        { CLASS_DRUID,   RAID_TARGET_ICON_CIRCLE },
+        { CLASS_PALADIN, RAID_TARGET_ICON_SQUARE },
+    };
+    static RaidTargetIcon const spareMarks[] =
+        { RAID_TARGET_ICON_SQUARE, RAID_TARGET_ICON_CIRCLE, RAID_TARGET_ICON_DIAMOND, RAID_TARGET_ICON_TRIANGLE,
+          RAID_TARGET_ICON_STAR };
+
+    for (auto const& classMark : classMarks)
+    {
+        for (PartyBotAI* pAI : bots)
+        {
+            if (pAI->me->GetClass() != classMark.first || !pAI->m_marksToCC.empty() || !pAI->HasCrowdControlSpell())
+                continue;
+
+            RaidTargetIcon mark = classMark.second;
+            if (taken.count(mark))
+            {
+                auto const itr = std::find_if(std::begin(spareMarks), std::end(spareMarks),
+                    [&taken](RaidTargetIcon spare) { return !taken.count(spare); });
+                if (itr == std::end(spareMarks))
+                    continue;
+                mark = *itr;
+            }
+            pAI->m_marksToCC.push_back(mark);
+            pAI->m_ccMarksAuto = true;
+            taken.insert(mark);
+        }
+    }
+
+    std::string const after = DescribeCCMarks(bots);
+    if (!reset && after == before)
+        return;
+
+    std::string const text = after.empty() ? "no CC marks (no bot can crowd-control)" : after;
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: CC marks (%s): %s", pLeader->GetName(), why, text.c_str());
+    if (!bots.empty())
+        bots.front()->SayInParty("CC marks: " + text);
 }
 
 void PartyBotAI::AddToPlayerGroup()
@@ -711,6 +893,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         bool const inCombat = me->IsInCombat();
         if (inCombat && !m_wasInCombat)
             WakeUp();
+        else if (!inCombat && m_wasInCombat)
+            m_releasedCC.clear(); // fight over: released CC marks count again next pull
         m_wasInCombat = inCombat;
 
         UpdateForcedAoE();
@@ -795,6 +979,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         me->UpdateZone(newzone, newarea);
 
         m_initialized = true;
+        AssignCCMarks(ObjectAccessor::FindPlayer(m_leaderGuid), false, "bot added");
         return;
     }
 
@@ -803,6 +988,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         ResetSpellData();
         PopulateSpellData();
         m_resetSpellData = false;
+        // A newly learned CC spell (ding) can give this bot a CC mark.
+        AssignCCMarks(ObjectAccessor::FindPlayer(m_leaderGuid), false, "spells learned");
     }
 
     Player* pLeader = GetPartyLeader();
@@ -2030,7 +2217,8 @@ bool PartyBotAI::IsForbiddenTarget(Unit const* pTarget) const
         if (!pAI)
             continue;
         for (auto mark : pAI->m_marksToCC)
-            if (pGroup->GetTargetWithIcon(mark) == pTarget->GetObjectGuid())
+            if (pGroup->GetTargetWithIcon(mark) == pTarget->GetObjectGuid() &&
+               !pAI->m_releasedCC.count(pTarget->GetObjectGuid()))
                 return true;
     }
     return false;
@@ -2686,14 +2874,14 @@ void PartyBotAI::UpdateInCombatAI_Paladin()
                 return;
         }
 
-        if (m_spells.paladin.pTurnEvil &&
+        if (m_spells.paladin.pTurnUndead &&
             m_role != ROLE_TANK)
         {
             Unit* pAttacker = SelectAttackerDifferentFrom(me->GetVictim());
             if (pAttacker && pAttacker->GetCreatureType() == CREATURE_TYPE_UNDEAD &&
-                CanTryToCastSpell(pAttacker, m_spells.paladin.pTurnEvil))
+                CanTryToCastSpell(pAttacker, m_spells.paladin.pTurnUndead))
             {
-                if (DoCastSpell(pAttacker, m_spells.paladin.pTurnEvil) == SPELL_CAST_OK)
+                if (DoCastSpell(pAttacker, m_spells.paladin.pTurnUndead) == SPELL_CAST_OK)
                     return;
             }
         }

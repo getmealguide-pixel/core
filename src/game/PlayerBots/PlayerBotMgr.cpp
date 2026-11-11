@@ -247,6 +247,10 @@ void PlayerBotMgr::Update(uint32 diff)
                         iter->second->ai->me->SpawnCorpseBones();
                     }
                     iter->second->ai->me->RemoveFromGroup();
+
+                    // Party bot gone: hand out the CC marks again (manual ones are kept).
+                    if (PartyBotAI* pPartyAI = dynamic_cast<PartyBotAI*>(iter->second->ai.get()))
+                        PartyBotAI::AssignCCMarks(ObjectAccessor::FindPlayer(pPartyAI->m_leaderGuid), false, "bot removed");
                 }
 
                 DeleteBot(iter);
@@ -1691,9 +1695,15 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
             if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 PSendSysMessage("%s will crowd control %s.", pTarget->GetName(), args);
+                // A manual mark replaces an automatic one; the other automatic marks are redone
+                // around it (a bot that had this mark automatically takes a spare one).
+                if (pAI->m_ccMarksAuto)
+                    pAI->m_marksToCC.clear();
+                pAI->m_ccMarksAuto = false;
                 pAI->m_marksToCC.push_back(itrMark->second);
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: ccmark %s -> %s (no bot attacks it unless ordered)",
                     pPlayer->GetName(), args, pTarget->GetName());
+                PartyBotAI::AssignCCMarks(pPlayer, false, "ccmark");
                 return true;
             }
         }
@@ -1721,6 +1731,9 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
             {
                 if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
+                    if (pAI->m_ccMarksAuto)
+                        pAI->m_marksToCC.clear();
+                    pAI->m_ccMarksAuto = false;
                     pAI->m_marksToCC.push_back(itrMark->second);
                 }
             }
@@ -1820,6 +1833,8 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
                 PSendSysMessage("All mark assignments cleared for %s.", pTarget->GetName());
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: clearmarks -> %s", pPlayer->GetName(), pTarget->GetName());
                 pAI->m_marksToCC.clear();
+                pAI->m_ccMarksAuto = false;
+                pAI->m_releasedCC.clear();
                 pAI->m_marksToFocus.clear();
                 return true;
             }
@@ -1849,6 +1864,8 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
                 if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
                     pAI->m_marksToCC.clear();
+                    pAI->m_ccMarksAuto = false;
+                    pAI->m_releasedCC.clear();
                     pAI->m_marksToFocus.clear();
                 }
             }
@@ -1857,6 +1874,23 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
 
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: clearmarks -> all bots", pPlayer->GetName());
     SendSysMessage("Mark assignments cleared for all bots.");
+    return true;
+}
+
+// .partybot mark: hand out all CC marks fresh (one fixed mark per CC-capable bot; manual ccmark
+// assignments are dropped). Focus marks are not touched (the skull is always a focus mark).
+bool ChatHandler::HandlePartyBotMarkCommand(char* /*args*/)
+{
+    Player* pPlayer = GetSession()->GetPlayer();
+    if (!pPlayer->GetGroup())
+    {
+        SendSysMessage("You are not in a group.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    PartyBotAI::AssignCCMarks(pPlayer, true, "mark command");
+    SendSysMessage("CC marks handed out again (see party chat).");
     return true;
 }
 
