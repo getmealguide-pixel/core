@@ -113,6 +113,7 @@ public:
     Player* SelectBuffTarget(SpellEntry const* pSingleSpellEntry, SpellEntry const* pGroupSpellEntry, SpellEntry const*& pSelectedSpellEntry) const;
     Player* SelectDispelTarget(SpellEntry const* pSpellEntry) const;
     bool IsValidBuffTarget(Unit const* pTarget, SpellEntry const* pSpellEntry) const;
+    static constexpr float HEAL_TARGET_RANGE = 40.0f; // heal spell range (was 30 yd: tanks 30-40 yd away were skipped)
     bool IsValidHealTarget(Unit const* pTarget, float healthPercent = 100.0f) const;
     bool IsValidHostileTarget(Unit const* pTarget) const;
     ObjectGuid m_breakCCTargetGuid;              // ordered attack: this enemy is valid even while crowd-controlled

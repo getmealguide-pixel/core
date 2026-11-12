@@ -199,11 +199,13 @@ enum PartyBotSpells
 #define PB_SHIELD_BLOCK_SPARE_RAGE 400   // ...or with this much rage (x10) to spare
 #define PB_BLOODRAGE_MAX_RAGE 200        // B13: tank Bloodrage in a fight below this rage (x10)...
 #define PB_BLOODRAGE_MIN_HEALTH_PCT 50.0f // ...and above this health % (it costs health)
+#define PB_HEAL_SKIP_LOG_PCT 80.0f    // healer log: hurt allies below this health it cannot reach
 #define PB_KITE_POINT_SPACING 4.0f    // F3: recorded kite path: a point every 4 yd
 #define PB_KITE_POINT_REACHED 2.5f    // F3: kiter is at a path point within this
 #define PB_KITE_CLAIM_RANGE 50.0f     // F3: kiter takes bosses within this of the path start
 #define PB_KITE_OPEN_TIMEOUT 10000    // F3: kiter pull: the boss must be fighting within 10 s
-#define PB_KITE_RUN_START 20.0f       // F3: run out once the boss on the kiter is this close
+#define PB_KITE_RUN_START 20.0f       // F3: without Distracting Shot: run out once the boss on the kiter is this close
+#define PB_KITE_OPEN_MARGIN 3.0f      // F3: open this far inside shot range (35 yd -> about 32 yd)
 #define PB_KITE_END_WAIT 3000         // F3: at the path end, Feign Death after this long
 #define PB_KITE_FEIGN_HEALTH_PCT 50.0f // F3: caught by the boss on the way out below this health: Feign Death
 #define PB_KITE_FEIGN_MIN_TIME 2000   // F3: lie still at least this long
@@ -670,7 +672,7 @@ Player* PartyBotAI::SelectShieldTarget() const
     return nullptr;
 }
 
-bool PartyBotAI::WalkIntoRange(Unit* pTarget, float range, char const* tag, char const* what)
+bool PartyBotAI::WalkIntoRange(Unit* pTarget, float range, char const* tag, char const* what, float margin)
 {
     bool const inRange = me->IsWithinDistInMap(pTarget, range - 2.0f);
     bool const inSight = me->IsWithinLOSInMap(pTarget);
@@ -688,7 +690,7 @@ bool PartyBotAI::WalkIntoRange(Unit* pTarget, float range, char const* tag, char
 
     // A point on the line to the target, well inside range (closer when sight is blocked).
     // Chase movement cannot be used: it stops when the target is not the bot's victim.
-    float const wanted = inSight ? range - 8.0f : 5.0f;
+    float const wanted = inSight ? range - margin : 5.0f;
     float const distance = me->GetDistance(pTarget);
     float const ratio = distance > wanted ? (distance - wanted) / distance : 0.0f;
     float const x = me->GetPositionX() + (pTarget->GetPositionX() - me->GetPositionX()) * ratio;
@@ -1429,6 +1431,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     bool const groupFighting = !me->IsInCombat() && !IsInDuel() && SelectPartyAttackTarget();
     m_groupFighting = groupFighting;
 
+    if (m_role == ROLE_HEALER)
+        LogUnhealableAllies();
+
     if (!me->IsInCombat())
     {
         if (groupFighting && (IsEating(me) || IsDrinking(me)))
@@ -2013,6 +2018,54 @@ void PartyBotAI::UpdateDiagnostics()
                 GetLogName(pAttacker).c_str(), pBossVictim ? pBossVictim->GetName() : "nobody",
                 pOld ? pOld->GetName() : "nobody");
             m_diagBossVictims[pAttacker->GetObjectGuid()] = victimGuid;
+        }
+    }
+}
+
+// Healer diagnostics: a hurt group member this healer cannot heal (out of reach of the bot heal
+// rule, HEAL_TARGET_RANGE, or out of sight) is logged once, again when the reason changes.
+void PartyBotAI::LogUnhealableAllies()
+{
+    Group* pGroup = me->GetGroup();
+    if (!pGroup || (!me->IsInCombat() && !m_groupFighting))
+    {
+        m_healSkipLogged.clear();
+        return;
+    }
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || pMember == me)
+            continue;
+        ObjectGuid const guid = pMember->GetObjectGuid();
+
+        uint8 reason = 0;
+        if (pMember->IsAlive() && pMember->IsInMap(me) && pMember->GetHealthPercent() < PB_HEAL_SKIP_LOG_PCT)
+        {
+            if (!me->IsWithinDist(pMember, HEAL_TARGET_RANGE))
+                reason = 1;
+            else if (!me->IsWithinLOSInMap(pMember))
+                reason = 2;
+        }
+
+        auto const logged = m_healSkipLogged.find(guid);
+        uint8 const before = logged != m_healSkipLogged.end() ? logged->second : 0;
+        if (reason == before)
+            continue;
+        if (reason)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Heal] %s: cannot heal %s at %.0f%% (%s, %.0f yd)", me->GetName(),
+                pMember->GetName(), pMember->GetHealthPercent(), reason == 1 ? "out of reach" : "out of sight",
+                me->GetDistance(pMember));
+            m_healSkipLogged[guid] = reason;
+        }
+        else
+        {
+            if (pMember->IsAlive() && pMember->IsInMap(me) && pMember->GetHealthPercent() < PB_HEAL_SKIP_LOG_PCT)
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Heal] %s: %s in reach again (%.0f%%, %.0f yd)", me->GetName(),
+                    pMember->GetName(), pMember->GetHealthPercent(), me->GetDistance(pMember));
+            m_healSkipLogged.erase(guid);
         }
     }
 }
@@ -4835,6 +4888,24 @@ void PartyBotAI::UpdateKiteMovement()
     }
 }
 
+// Take -> out: run the path from its point nearest to the hunter.
+void PartyBotAI::StartKiteRunOut(Unit* pBoss, char const* why)
+{
+    std::vector<PartyBotKitePoint> const path = GetKitePath(me->GetMapId());
+    int32 nearest = 0;
+    for (int32 i = 1; i < int32(path.size()); ++i)
+        if (GetKitePointDistance(me, path[i]) < GetKitePointDistance(me, path[nearest]))
+            nearest = i;
+    m_kiteIndex = nearest;
+    if (me->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        me->InterruptSpell(CURRENT_AUTOREPEAT_SPELL, true);
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: runs out (%s) after %.1f s from point %i of %u (boss %.0f yd, on %s)",
+        me->GetName(), why, WorldTimer::getMSTimeDiffToNow(m_kitePhaseTime) / 1000.0f, nearest, uint32(path.size()),
+        me->GetDistance(pBoss), pBoss->GetVictim() ? pBoss->GetVictim()->GetName() : "nobody");
+    SetKitePhase(PB_KITE_OUT);
+    UpdateKiteMovement();
+}
+
 // Returns true while the kite runs (the rest of the AI update is skipped).
 bool PartyBotAI::UpdateKite()
 {
@@ -4970,9 +5041,8 @@ bool PartyBotAI::UpdateKite()
         }
     }
 
-    // Faster than the boss: Aspect of the Cheetah once running (not while taking the boss: a hit
-    // dazes a Cheetah hunter).
-    if (m_kitePhase == PB_KITE_OUT &&
+    // Faster than the boss: Aspect of the Cheetah from the start (before the opener) to the end.
+    if ((m_kitePhase == PB_KITE_TAKE || m_kitePhase == PB_KITE_OUT) &&
         m_spells.hunter.pAspectOfTheCheetah && !me->HasAura(m_spells.hunter.pAspectOfTheCheetah->Id) &&
         CanTryToCastSpell(me, m_spells.hunter.pAspectOfTheCheetah) &&
         DoCastSpell(me, m_spells.hunter.pAspectOfTheCheetah) == SPELL_CAST_OK)
@@ -4996,29 +5066,12 @@ bool PartyBotAI::UpdateKite()
     if (me->IsNonMeleeSpellCasted(false, false, true))
         return true;
 
-    // No Cheetah while taking the boss (a guard hit would daze the hunter before it runs).
-    if (m_spells.hunter.pAspectOfTheCheetah && me->HasAura(m_spells.hunter.pAspectOfTheCheetah->Id))
-        me->RemoveAurasDueToSpell(m_spells.hunter.pAspectOfTheCheetah->Id);
 
-    // Take: the boss attacks the hunter and is close -> run out from the nearest path point. Until
-    // then the guards (faster) reach the group first and the tanks taunt them off the hunter.
-    if (onMe && me->GetCombatDistance(pBoss) < PB_KITE_RUN_START)
+    // Take: run out from the nearest path point once Distracting Shot is out (or the boss is on
+    // the hunter and close, when there is no Distracting Shot).
+    if (onMe && (m_kiteDistracted || me->GetCombatDistance(pBoss) < PB_KITE_RUN_START))
     {
-        std::vector<PartyBotKitePoint> const path = GetKitePath(me->GetMapId());
-        int32 nearest = 0;
-        for (int32 i = 1; i < int32(path.size()); ++i)
-            if (GetKitePointDistance(me, path[i]) < GetKitePointDistance(me, path[nearest]))
-                nearest = i;
-        m_kiteIndex = nearest;
-        if (me->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
-            me->InterruptSpell(CURRENT_AUTOREPEAT_SPELL, true);
-        if (me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
-            me->InterruptSpell(CURRENT_GENERIC_SPELL);
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: boss on me after %.1f s, runs out from point %i of %u (boss %.0f yd)",
-            me->GetName(), WorldTimer::getMSTimeDiffToNow(m_kitePhaseTime) / 1000.0f, nearest, uint32(path.size()),
-            me->GetDistance(pBoss));
-        SetKitePhase(PB_KITE_OUT);
-        UpdateKiteMovement();
+        StartKiteRunOut(pBoss, "boss on me");
         return true;
     }
 
@@ -5026,7 +5079,7 @@ bool PartyBotAI::UpdateKite()
     me->SetFacingToObject(pBoss);
     SpellEntry const* pShot = GetRangedWeaponSpell();
     float const range = pShot ? Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pShot->rangeIndex)) : 30.0f;
-    if (WalkIntoRange(pBoss, range, "Kite", "shots"))
+    if (WalkIntoRange(pBoss, range, "Kite", "shots", PB_KITE_OPEN_MARGIN))
         return true;
 
     // Opener on a boss not fighting yet: Aimed Shot (3 s cast; Arcane Shot without it).
@@ -5050,6 +5103,9 @@ bool PartyBotAI::UpdateKite()
         m_kiteDistracted = true;
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: Distracting Shot on %s (on %s, %.0f yd)", me->GetName(),
             GetLogName(pBoss).c_str(), pBoss->GetVictim() ? pBoss->GetVictim()->GetName() : "nobody", me->GetDistance(pBoss));
+        // The boss already fights (opener landed): run at once, no standing.
+        if (pBoss->IsInCombat())
+            StartKiteRunOut(pBoss, "right after Distracting Shot");
         return true;
     }
     if (m_spells.hunter.pArcaneShot && CanTryToCastSpell(pBoss, m_spells.hunter.pArcaneShot) &&

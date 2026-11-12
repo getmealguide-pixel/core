@@ -145,7 +145,7 @@ public:
     bool ShootRangedWeapon(Unit* pTarget);
     // Walks until the enemy is within range and in sight (point movement), leaving a stay spot.
     // Returns true while walking. tag/what: for the log line.
-    bool WalkIntoRange(Unit* pTarget, float range, char const* tag, char const* what);
+    bool WalkIntoRange(Unit* pTarget, float range, char const* tag, char const* what, float margin = 8.0f);
     void ClearOrderedTarget();
     // Pull timer for damage dealers: they hold still until it ends; a bot with a CC mark first
     // walks into range of the marked enemy and crowd-controls it. Any new order ends the wait.
@@ -163,6 +163,7 @@ public:
     // replaced: a new CC cast already started (judged at once, not when casting stops).
     void UpdateCCCastOutcome(bool replaced = false);
     void UpdateDiagnostics();
+    void LogUnhealableAllies();                  // healer: hurt allies out of reach or sight
     void OnCastStarted(Unit* pTarget, SpellEntry const* pSpellEntry) final;
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
@@ -352,6 +353,7 @@ public:
     uint32 m_diagLostControlTime = 0;            // B12: when the tank lost control (ms)
     ObjectGuid m_diagLastAttackerGuid;           // B12: enemy last hitting this bot
     std::map<ObjectGuid, ObjectGuid> m_diagBossVictims; // B12: boss -> victim last logged
+    std::map<ObjectGuid, uint8> m_healSkipLogged; // hurt ally -> 1 out of reach, 2 out of sight (logged)
     bool m_supplyBagFullLogged = false;          // "bags full" logged this fight
     uint32 m_bandageSpellId = 0;                 // spell of the bandage being channeled, 0 = none
     ObjectGuid m_bandageTargetGuid;              // enemy attacked before bandaging (re-attacked after)
@@ -395,6 +397,7 @@ public:
     bool UpdateKite();
     void UpdateKiteMovement();                   // every tick: path running, getting up
     void SetKitePhase(PartyBotKitePhase phase);
+    void StartKiteRunOut(Unit* pBoss, char const* why);
     void EndKite(char const* why);
     ObjectGuid m_stepBackFailGuid;               // B7: "no safe spot" logged once for this target
     ObjectGuid m_ccIdleLoggedGuid;               // CC mark not fighting yet, no pull order (logged once)

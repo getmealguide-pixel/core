@@ -2046,7 +2046,7 @@ bool CombatBotBaseAI::IsValidHealTarget(Unit const* pTarget, float healthPercent
     return (pTarget->GetHealthPercent() < healthPercent) &&
             me->IsValidHelpfulTarget(pTarget) &&
             me->IsWithinLOSInMap(pTarget) &&
-            me->IsWithinDist(pTarget, 30.0f);
+            me->IsWithinDist(pTarget, HEAL_TARGET_RANGE);
 }
 
 Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPercent) const
