@@ -182,7 +182,13 @@ public:
     // party chat and the enemy is attacked normally.
     void ReleaseCCMark(Unit* pTarget, SpellEntry const* pSpellEntry, char const* why);
     void SayInParty(std::string const& text) const;
-    Unit* SelectLooseEnemy(PartyBotTankSlotMap const& slots) const;
+    // Loose enemies: any, bosses only (claims by other tanks ignored), or no bosses.
+    enum LooseBossFilter { PB_LOOSE_ANY, PB_LOOSE_BOSSES_ONLY, PB_LOOSE_NO_BOSSES };
+    Unit* SelectLooseEnemy(PartyBotTankSlotMap const& slots, LooseBossFilter filter = PB_LOOSE_ANY) const;
+    // Boss (19b): rank 3 creature or an enemy with one of this bot's focusmark icons (not skull).
+    bool IsBossTarget(Unit const* pUnit) const;
+    // Takes loose bosses: the MT, or any tank when no MT is alive within 50 yd.
+    bool IsBossTankOwner(PartyBotTankSlotMap const& slots) const;
     bool TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, bool otherTanks);
     bool UpdateTankDuty();
     // Threat on every enemy: threat lead on an enemy, and switching to the least safe enemy
@@ -317,6 +323,8 @@ public:
     PartyBotAoEMode m_aoeMode = PB_AOE_AUTO;     // damage dealers' area spells
     bool m_forcedAoEFought = false;              // forced AoE: the bot has fought since it was set
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
+    ObjectGuid m_heldBossGuid;                   // boss this tank stays on (logged once)
+    ObjectGuid m_looseAddLoggedGuid;             // loose add left to the group while holding a boss (logged once)
     mutable PartyBotTankSlotMap m_tankSlotCache;
     mutable uint32 m_tankSlotCacheTime = 0;
     PartyBotLayer m_activeLayer = PB_LAYER_NONE;

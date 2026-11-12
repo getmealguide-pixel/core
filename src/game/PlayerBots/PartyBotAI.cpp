@@ -2852,9 +2852,35 @@ bool PartyBotAI::IsForbiddenTarget(Unit const* pTarget) const
     return false;
 }
 
+bool PartyBotAI::IsBossTarget(Unit const* pUnit) const
+{
+    if (pUnit->GetTypeId() == TYPEID_UNIT && static_cast<Creature const*>(pUnit)->IsWorldBoss())
+        return true;
+
+    for (auto markId : m_marksToFocus)
+        if (markId != RAID_TARGET_ICON_SKULL && GetMarkedTarget(markId) == pUnit)
+            return true;
+    return false;
+}
+
+bool PartyBotAI::IsBossTankOwner(PartyBotTankSlotMap const& slots) const
+{
+    for (auto const& itr : slots)
+    {
+        if (itr.second != PB_TANK_SLOT_MT)
+            continue;
+        if (itr.first == me->GetObjectGuid())
+            return true;
+        Player const* pMainTank = ObjectAccessor::FindPlayer(itr.first);
+        return !(pMainTank && pMainTank->IsAlive() && pMainTank->IsInMap(me) && me->IsWithinDist(pMainTank, 50.0f));
+    }
+    return true; // no main tank
+}
+
 // Nearest enemy attacking a group member without a tank slot, that no other tank bot is
-// already going for (so off-tanks share the adds out).
-Unit* PartyBotAI::SelectLooseEnemy(PartyBotTankSlotMap const& slots) const
+// already going for (so off-tanks share the adds out). Bosses only: the boss owner takes them
+// even when another tank is going for them.
+Unit* PartyBotAI::SelectLooseEnemy(PartyBotTankSlotMap const& slots, LooseBossFilter filter) const
 {
     Group* pGroup = me->GetGroup();
     Unit* pBest = nullptr;
@@ -2871,8 +2897,11 @@ Unit* PartyBotAI::SelectLooseEnemy(PartyBotTankSlotMap const& slots) const
             if (!IsValidHostileTarget(pAttacker) || IsForbiddenTarget(pAttacker) || !me->IsWithinDist(pAttacker, 50.0f))
                 continue;
 
+            if (filter != PB_LOOSE_ANY && IsBossTarget(pAttacker) != (filter == PB_LOOSE_BOSSES_ONLY))
+                continue;
+
             bool claimed = false;
-            for (GroupReference* itr2 = pGroup->GetFirstMember(); itr2 != nullptr; itr2 = itr2->next())
+            for (GroupReference* itr2 = pGroup->GetFirstMember(); filter != PB_LOOSE_BOSSES_ONLY && itr2 != nullptr; itr2 = itr2->next())
             {
                 Player* pOther = itr2->getSource();
                 if (pOther && pOther != me && pOther->AI() && pOther->GetVictim() == pAttacker &&
@@ -3054,14 +3083,60 @@ bool PartyBotAI::UpdateTankDuty()
         return TauntIfAllowed(pMark, slots, otherTanks);
     }
 
+    // Boss rule (19b): a tank stays on a boss while it holds it, and the boss owner (MT) also while
+    // the boss is loose. Marks, pull targets, loose adds and threat rescue never pull it off; only
+    // an attack order on another enemy (or singlefocus above) does. Loose bosses go to the owner.
+    bool const bossOwner = IsBossTankOwner(slots);
+    bool const attackOrderElsewhere = m_orderOverridesCC && pMark && pMark != pVictim &&
+        pMark->GetObjectGuid() == m_orderedTargetGuid;
+    if (pVictim && !attackOrderElsewhere && IsBossTarget(pVictim) &&
+       (pVictim->GetVictim() == me ||
+       (bossOwner && GetSlotOf(slots, pVictim->GetVictim()) == PB_TANK_SLOT_NONE)))
+    {
+        if (m_heldBossGuid != pVictim->GetObjectGuid())
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s (%s): stays on boss %s", me->GetName(),
+                GetTankSlotName(mySlot).c_str(), pVictim->GetName());
+            m_heldBossGuid = pVictim->GetObjectGuid();
+        }
+        // An add no other tank goes for is left to the group (CC, damage dealers).
+        if (Unit* pLoose = SelectLooseEnemy(slots, PB_LOOSE_NO_BOSSES))
+            if (m_looseAddLoggedGuid != pLoose->GetObjectGuid())
+            {
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: keeps boss %s, no free off-tank for %s (attacks %s)",
+                    me->GetName(), pVictim->GetName(), pLoose->GetName(),
+                    pLoose->GetVictim() ? pLoose->GetVictim()->GetName() : "nobody");
+                m_looseAddLoggedGuid = pLoose->GetObjectGuid();
+            }
+        return TauntIfAllowed(pVictim, slots, otherTanks);
+    }
+    m_heldBossGuid.Clear();
+
+    if (bossOwner && !attackOrderElsewhere)
+    {
+        if (Unit* pBoss = SelectLooseEnemy(slots, PB_LOOSE_BOSSES_ONLY))
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s (%s): grabs boss %s from %s", me->GetName(),
+                GetTankSlotName(mySlot).c_str(), pBoss->GetName(),
+                pBoss->GetVictim() ? pBoss->GetVictim()->GetName() : "nobody");
+            me->AttackStop(true);
+            AttackStart(pBoss);
+            m_heldBossGuid = pBoss->GetObjectGuid();
+            return TauntIfAllowed(pBoss, slots, otherTanks);
+        }
+    }
+
     // With a mark: free to leave it while it is covered - on us (even with a thin threat lead:
-    // enemies already hitting group members come first) or held by another tank.
+    // enemies already hitting group members come first) or held by another tank. A boss mark is
+    // left to the boss owner.
     Unit* pMarkVictim = pMark ? pMark->GetVictim() : nullptr;
-    bool const markHeld = pMarkVictim &&
-        (pMarkVictim == me || GetSlotOf(slots, pMarkVictim) != PB_TANK_SLOT_NONE);
+    bool const markHeld = (pMarkVictim &&
+        (pMarkVictim == me || GetSlotOf(slots, pMarkVictim) != PB_TANK_SLOT_NONE)) ||
+        (pMark && !bossOwner && IsBossTarget(pMark));
     // Back to the mark when it hits someone else; a mark that fights nobody yet (pull target on its
     // way, or not pulled) waits until no loose enemy is left.
-    if (pMark && pVictim != pMark && !markHeld && (pMarkVictim || !SelectLooseEnemy(slots)))
+    LooseBossFilter const looseFilter = bossOwner ? PB_LOOSE_ANY : PB_LOOSE_NO_BOSSES;
+    if (pMark && pVictim != pMark && !markHeld && (pMarkVictim || !SelectLooseEnemy(slots, looseFilter)))
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s)", me->GetName(),
             pVictim ? pVictim->GetName() : "none", pMark->GetName(), markReason);
@@ -3070,12 +3145,13 @@ bool PartyBotAI::UpdateTankDuty()
         return TauntIfAllowed(pMark, slots, otherTanks);
     }
 
-    // Grab a loose enemy unless the current target is one already.
+    // Grab a loose enemy unless the current target is one already (a loose boss counts only for
+    // the boss owner).
     bool const victimIsLoose = pVictim && pVictim->GetVictim() && pVictim->GetVictim() != me &&
-        GetSlotOf(slots, pVictim->GetVictim()) == PB_TANK_SLOT_NONE;
+        GetSlotOf(slots, pVictim->GetVictim()) == PB_TANK_SLOT_NONE && (bossOwner || !IsBossTarget(pVictim));
     if (!victimIsLoose)
     {
-        if (Unit* pLoose = SelectLooseEnemy(slots))
+        if (Unit* pLoose = SelectLooseEnemy(slots, looseFilter))
         {
             if (pLoose != pVictim)
             {
@@ -3094,9 +3170,9 @@ bool PartyBotAI::UpdateTankDuty()
 
     pVictim = TabForThreat(pVictim);
 
-    if (TauntIfAllowed(pVictim, slots, otherTanks))
+    if ((bossOwner || !IsBossTarget(pVictim)) && TauntIfAllowed(pVictim, slots, otherTanks))
         return true;
-    return pMark && TauntIfAllowed(pMark, slots, otherTanks);
+    return pMark && (bossOwner || !IsBossTarget(pMark)) && TauntIfAllowed(pMark, slots, otherTanks);
 }
 
 // Damaging area spells only: fears, roots, stuns and spells without damage (shouts, taunts) are left
