@@ -147,6 +147,7 @@ public:
     // A player opened a trade with this bot (16b): mage puts 20 conjured food (+ 20 water for mana
     // users), warlock a healthstone, in the window. Free items, no cast.
     void FillSupplyTrade();
+    void PickLockInTrade(); // rogue: Pick Lock on the trader's "will not be traded" slot
     void EnsureSpellReagents(SpellEntry const* pSpellEntry); // free reagents/totems, before the cast
     uint8 GetHighestHonorRankFromEquippedItems() const;
     void UpdateVisualHonorRankBasedOnItems();
@@ -356,7 +357,7 @@ public:
     {
         struct
         {
-            SpellEntry const* spells[45];
+            SpellEntry const* spells[46]; // >= the largest class struct below (druid)
         } raw;
         struct
         {
@@ -407,6 +408,7 @@ public:
             SpellEntry const* pAspectOfTheCheetah;
             SpellEntry const* pAspectOfTheMonkey;
             SpellEntry const* pAspectOfTheHawk;
+            SpellEntry const* pTrueshotAura;
             SpellEntry const* pSerpentSting;
             SpellEntry const* pArcaneShot;
             SpellEntry const* pAimedShot;
@@ -596,6 +598,7 @@ public:
             SpellEntry const* pRebirth;
             SpellEntry const* pFaerieFire;
             SpellEntry const* pInnervate;
+            SpellEntry const* pSwiftmend;
             SpellEntry const* pNaturesSwiftness;
             SpellEntry const* pEntanglingRoots;
             SpellEntry const* pHibernate;

@@ -2480,9 +2480,10 @@ void PartyBotAI::LearnRoleSpecTalents(PlayerPremadeSpecTemplate const& spec)
         me->GetName(), me->GetLevel(), spec.name.c_str(), list.c_str());
 }
 
-// Talents of the role's spec, then trainer spells up to the current level (after the talents:
-// higher ranks of talent spells such as Bloodthirst need rank 1). resetTalents starts the
-// talents over (new bot, respec). Points the spec cannot use stay unspent and are logged.
+// Talents of the role's spec, then class quest spells, then trainer spells up to the current level
+// (in this order: higher ranks need rank 1, e.g. Bloodthirst needs the talent, Dire Bear Form the
+// quest Bear Form). resetTalents starts the talents over (new bot, respec). Points the spec
+// cannot use stay unspent and are logged.
 void PartyBotAI::LearnSpellsAndTalentsForLevel(bool resetTalents)
 {
     if (resetTalents)
@@ -2492,7 +2493,10 @@ void PartyBotAI::LearnSpellsAndTalentsForLevel(bool resetTalents)
     if (pSpec)
         LearnRoleSpecTalents(*pSpec);
 
+    // Class quest spells (warlock demons and mounts, Berserker Stance, Bear Form, Tame Beast):
+    // trainers do not teach them, so without this a bot that dings never gets them.
     char args[] = "";
+    ChatHandler(me).HandleLearnAllQuestsCommand(args);
     ChatHandler(me).HandleLearnAllTrainerCommand(args);
 
     if (uint32 const unspent = me->GetFreeTalentPoints())
@@ -3736,6 +3740,14 @@ void PartyBotAI::UpdateOutOfCombatAI_Hunter()
         CanTryToCastSpell(me, m_spells.hunter.pAspectOfTheHawk))
     {
         if (DoCastSpell(me, m_spells.hunter.pAspectOfTheHawk) == SPELL_CAST_OK)
+            return;
+    }
+
+    // Party aura, lasts until death; CanTryToCastSpell skips it while it is up.
+    if (m_spells.hunter.pTrueshotAura &&
+        CanTryToCastSpell(me, m_spells.hunter.pTrueshotAura))
+    {
+        if (DoCastSpell(me, m_spells.hunter.pTrueshotAura) == SPELL_CAST_OK)
             return;
     }
 
@@ -5346,10 +5358,19 @@ void PartyBotAI::UpdateInCombatAI_Druid()
             if (HealInjuredTargetPeriodic(pTarget))
                 return;
 
-        // Direct heal.
+        // Direct heal: Swiftmend first (instant) when the target has a druid's Rejuvenation or
+        // Regrowth (same check as the core's Swiftmend script).
         if (Unit* pTarget = SelectHealTarget(60.0f, 70.0f))
+        {
+            if (m_spells.druid.pSwiftmend &&
+                pTarget->GetAura(SPELL_AURA_PERIODIC_HEAL, SPELLFAMILY_DRUID, uint64(0x50)) &&
+                CanTryToCastSpell(pTarget, m_spells.druid.pSwiftmend) &&
+                DoCastSpell(pTarget, m_spells.druid.pSwiftmend) == SPELL_CAST_OK)
+                return;
+
             if (HealInjuredTargetDirect(pTarget))
                 return;
+        }
 
         if (m_spells.druid.pInnervate &&
            (me->GetHealthPercent() > 40.0f) &&

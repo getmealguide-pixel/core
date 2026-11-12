@@ -594,6 +594,11 @@ void CombatBotBaseAI::PopulateSpellData()
                     if (IsHigherRankSpell(m_spells.hunter.pAspectOfTheHawk))
                         m_spells.hunter.pAspectOfTheHawk = pSpellEntry;
                 }
+                else if (pSpellEntry->SpellName[0].find("Trueshot Aura") != std::string::npos)
+                {
+                    if (IsHigherRankSpell(m_spells.hunter.pTrueshotAura))
+                        m_spells.hunter.pTrueshotAura = pSpellEntry;
+                }
                 else if (pSpellEntry->SpellName[0].find("Aspect of the Monkey") != std::string::npos)
                 {
                     if (IsHigherRankSpell(m_spells.hunter.pAspectOfTheMonkey))
@@ -1418,6 +1423,11 @@ void CombatBotBaseAI::PopulateSpellData()
                     if (IsHigherRankSpell(m_spells.druid.pMoonkinForm))
                         m_spells.druid.pMoonkinForm = pSpellEntry;
                 }
+                else if (pSpellEntry->Id == 18562) // Swiftmend (before 1.12 this id was Innervate)
+                {
+                    if (IsHigherRankSpell(m_spells.druid.pSwiftmend))
+                        m_spells.druid.pSwiftmend = pSpellEntry;
+                }
                 else if (pSpellEntry->SpellName[0].find("Wrath") != std::string::npos)
                 {
                     if (IsHigherRankSpell(m_spells.druid.pWrath))
@@ -1627,7 +1637,10 @@ void CombatBotBaseAI::PopulateSpellData()
             switch (pSpellEntry->Effect[i])
             {
                 case SPELL_EFFECT_HEAL:
-                    m_spellListDirectHeal.insert(pSpellEntry);
+                    // Swiftmend heals from a Rejuvenation/Regrowth on the target (base points 0):
+                    // cast on its own in the druid rotation, not picked as a normal direct heal.
+                    if (pSpellEntry->Id != 18562)
+                        m_spellListDirectHeal.insert(pSpellEntry);
                     break;
                 case SPELL_EFFECT_ATTACK_ME:
                     m_spellListTaunt.push_back(pSpellEntry);
@@ -3501,6 +3514,40 @@ static SpellEntry const* GetTradeBuffSpell(ItemPrototype const* pProto)
     return nullptr;
 }
 
+#define PB_SPELL_PICK_LOCK 1804
+
+// Rogue: the trader put a locked item in the "will not be traded" slot. Like a player's client,
+// cast Pick Lock on that slot: the core checks the lock and skill, remembers it as this side's
+// trade spell and casts it when both accept (the item stays with its owner).
+void CombatBotBaseAI::PickLockInTrade()
+{
+    TradeData* pTrade = me->GetTradeData();
+    if (!pTrade || pTrade->GetSpell() || !me->HasSpell(PB_SPELL_PICK_LOCK))
+        return;
+
+    Item* pItem = pTrade->GetTraderData()->GetItem(TRADE_SLOT_NONTRADED);
+    if (!pItem || !pItem->GetProto()->LockID || pItem->HasFlag(ITEM_FIELD_FLAGS, ITEM_DYNFLAG_UNLOCKED))
+        return;
+
+    SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(PB_SPELL_PICK_LOCK);
+    if (!pSpellEntry)
+        return;
+
+    // Pick Lock needs Thieves' Tools in the bags (spell totem item), free like other supplies.
+    EnsureSpellReagents(pSpellEntry);
+
+    SpellCastTargets targets;
+    targets.setTradeItemTarget(me);
+    SpellCastResult const result = (new Spell(me, pSpellEntry, false))->prepare(std::move(targets));
+
+    if (pTrade->GetSpell() == PB_SPELL_PICK_LOCK)
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: will pick the lock of %s when the trade is accepted",
+            me->GetName(), pItem->GetProto()->Name1);
+    else
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: cannot pick the lock of %s (Lockpicking %u, cast result %u)",
+            me->GetName(), pItem->GetProto()->Name1, me->GetSkillValue(SKILL_LOCKPICKING), uint32(result));
+}
+
 #define PB_SUPPLY_TRADE_COUNT 20
 
 void CombatBotBaseAI::FillSupplyTrade()
@@ -3564,7 +3611,8 @@ void CombatBotBaseAI::FillSupplyTrade()
     else
     {
         // Healthstone by warlock level (trainer levels of Create Healthstone). Not via the learned
-        // spell: bots were found without it (cause unknown, 2026-11-11).
+        // spell: in 1.12 every Create Healthstone rank is a script effect (picks the item by the
+        // Improved Healthstone talent), so GetBestCreateItemSpell cannot see its item.
         static struct { uint32 minLevel, itemId; } const healthstones[] =
             { { 58, 9421 }, { 46, 5510 }, { 34, 5509 }, { 22, 5511 }, { 10, 5512 } };
         for (auto const& entry : healthstones)
@@ -4043,6 +4091,21 @@ void CombatBotBaseAI::OnPacketReceived(WorldPacket const* packet)
                 EquipOrUseNewItem();
                 UpdateVisualHonorRankBasedOnItems();
             }
+            break;
+        }
+        case SMSG_TRADE_STATUS_EXTENDED:
+        {
+            // Trade window changed. Sent before the core clears this side's trade spell for a
+            // changed "will not be traded" slot, so the rogue looks one update later.
+            if (!me || me->GetClass() != CLASS_ROGUE)
+                return;
+
+            Player* pRogue = me;
+            pRogue->m_Events.AddLambdaEventAtOffset([pRogue]()
+            {
+                if (CombatBotBaseAI* pAI = dynamic_cast<CombatBotBaseAI*>(pRogue->AI()))
+                    pAI->PickLockInTrade();
+            }, 1);
             break;
         }
         case SMSG_RESURRECT_REQUEST:
