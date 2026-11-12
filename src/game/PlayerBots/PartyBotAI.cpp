@@ -815,6 +815,10 @@ bool PartyBotAI::CrowdControlMarkedTargets()
         if (!CanTryToCastSpell(pTarget, pSpellEntry))
             continue;
 
+        // The previous CC cast may have ended after this tick's outcome check: judge it first.
+        if (m_ccCastSpellId)
+            UpdateCCCastOutcome();
+
         SpellCastResult const result = DoCastSpell(pTarget, pSpellEntry);
         if (result == SPELL_CAST_OK)
         {
