@@ -792,6 +792,19 @@ bool PartyBotAI::CrowdControlMarkedTargets()
         if (!pSpellEntry)
             continue;
 
+        // Never start a fight for a CC mark: an enemy that is not fighting yet is only crowd-
+        // controlled during a pull order (the pull timer: the leader chose to pull that pack).
+        if (!pTarget->IsInCombat() && !IsPullCCWindow())
+        {
+            if (m_ccIdleLoggedGuid != pTarget->GetObjectGuid())
+            {
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s waits for %s (not fighting yet, no pull order)",
+                    me->GetName(), pSpellEntry->SpellName[0].c_str(), GetLogName(pTarget).c_str());
+                m_ccIdleLoggedGuid = pTarget->GetObjectGuid();
+            }
+            continue;
+        }
+
         // Wrong creature type or immune: release the mark instead of trying forever.
         if (pSpellEntry->TargetCreatureType && !(pSpellEntry->TargetCreatureType & pTarget->GetCreatureTypeMask()))
         {
@@ -1776,14 +1789,20 @@ void PartyBotAI::StartHealerPullCC(uint32 duration)
     m_healerPullCCDuration = duration;
 }
 
+// Pull timer running: DPS pull wait or a healer's pull CC (enemies not fighting yet may be CC'd).
+bool PartyBotAI::IsPullCCWindow() const
+{
+    return IsPullWaiting() || (m_healerPullCCDuration &&
+        WorldTimer::getMSTimeDiffToNow(m_healerPullCCStart) < m_healerPullCCDuration);
+}
+
 // A healer crowd-controls its marks after a pull order (for the pull timer) or while the group
 // fights; out of a fight it never starts one with crowd control.
 bool PartyBotAI::IsHealerCCActive() const
 {
     if (m_role != ROLE_HEALER)
         return false;
-    return m_groupFighting || me->IsInCombat() || (m_healerPullCCDuration &&
-        WorldTimer::getMSTimeDiffToNow(m_healerPullCCStart) < m_healerPullCCDuration);
+    return m_groupFighting || me->IsInCombat() || IsPullCCWindow();
 }
 
 // Healers: an ally below PB_URGENT_HEAL_PCT is healed before a pending CC mark (logged once).

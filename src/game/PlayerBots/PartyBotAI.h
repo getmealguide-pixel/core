@@ -146,6 +146,7 @@ public:
     // the group fights, also out of combat; an urgent heal (anyone below PB_URGENT_HEAL_PCT) first.
     void StartHealerPullCC(uint32 duration);
     bool IsHealerCCActive() const;
+    bool IsPullCCWindow() const;
     bool HealsBeforeCC();
     // B1 diagnostics: logs whether this bot's last CC cast landed, was cancelled or did not land.
     // replaced: a new CC cast already started (judged at once, not when casting stops).
@@ -351,6 +352,7 @@ public:
     uint32 m_stepBackTime = 0;                   // B7: last step-back try (ms), 0 = none
     bool m_steppingBack = false;                 // B7: walking to the step-back spot
     ObjectGuid m_stepBackFailGuid;               // B7: "no safe spot" logged once for this target
+    ObjectGuid m_ccIdleLoggedGuid;               // CC mark not fighting yet, no pull order (logged once)
     ObjectGuid m_ccFailGuid;                     // last failed CC cast: target and result (logged once)
     uint32 m_ccFailResult = 0;
     ObjectGuid m_approachGuid;                   // enemy this bot walks towards (CC, ranged pull)
