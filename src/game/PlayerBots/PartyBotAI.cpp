@@ -176,6 +176,7 @@ enum PartyBotSpells
 #define PB_RANGED_PULL_WAIT (6 * IN_MILLISECONDS)     // rpull: wait this long after the shot for the target
 #define PB_RANGED_PULL_TIMEOUT (10 * IN_MILLISECONDS) // rpull: melee pull if no shot left by then
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
+#define PB_FOLLOW_ORDER_NO_SIT_MS 10000
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
 #define PB_AUTO_AOE_RADIUS 10.0f     // pack size = enemies within this of the target (incl. the target)
@@ -428,7 +429,38 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
                 return false;
         }
     }
+    else if (pTarget && !pSpellEntry->IsPositiveSpell() && !IsInDuel() && !IsChainSpellSafe(pTarget, pSpellEntry))
+        return false;
 
+    return true;
+}
+
+// Chain spells are not area spells in the spell data, but jump to enemies next to the target
+// (ranged: up to 10 yd per jump, as the core searches; melee such as Cleave: around the caster).
+// Same rules as area spells: never break crowd control (CC marks: not for tanks), never pull
+// enemies that are not fighting yet (weak ones excepted).
+bool PartyBotAI::IsChainSpellSafe(Unit const* pTarget, SpellEntry const* pSpellEntry) const
+{
+    uint32 jumps = 0;
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (pSpellEntry->Effect[i] && pSpellEntry->EffectChainTarget[i] > 1)
+            jumps = std::max(jumps, pSpellEntry->EffectChainTarget[i] - 1);
+    if (!jumps)
+        return true;
+
+    bool const melee = pSpellEntry->DmgClass == SPELL_DAMAGE_CLASS_MELEE;
+    std::list<Unit*> targets;
+    me->GetEnemyListInRadiusAround(melee ? me : pTarget, melee ? ATTACK_DISTANCE + 2.0f : jumps * CHAIN_SPELL_JUMP_RADIUS,
+        targets);
+    for (auto const& pEnemy : targets)
+    {
+        if (pEnemy == pTarget)
+            continue;
+        if (pEnemy->HasBreakableByDamageCrowdControlAura() || (m_role != ROLE_TANK && IsForbiddenTarget(pEnemy)))
+            return false;
+        if (!pEnemy->IsInCombat() && (pEnemy->GetLevel() + 5) > me->GetLevel() && pEnemy->IsValidAttackTarget(me))
+            return false;
+    }
     return true;
 }
 
@@ -697,8 +729,8 @@ bool PartyBotAI::ShootRangedWeapon(Unit* pTarget)
 }
 
 // Crowd-controls the CC marks given to this bot (pull timer, in and out of combat). Out of spell
-// range or line of sight it first walks there (also off a stay spot). Never the target of its own
-// attack order. Returns true while it casts or walks for it.
+// range or line of sight it first walks there, except on stay (it says so once and stays). Never
+// the target of its own attack order. Returns true while it casts or walks for it.
 static char const* GetCreatureTypeName(uint32 creatureType)
 {
     switch (creatureType)
@@ -761,6 +793,20 @@ bool PartyBotAI::CrowdControlMarkedTargets()
             continue;
         }
 
+        // On stay (stay, comestay, move here) the bot never walks off its spot for a CC mark.
+        if (m_holdPosition && !IsInCrowdControlReach(pTarget))
+        {
+            if (m_ccOutOfReachGuid != pTarget->GetObjectGuid())
+            {
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: on stay, %s out of %s range or sight (%.0f yd), stays",
+                    me->GetName(), pTarget->GetName(), pSpellEntry->SpellName[0].c_str(), me->GetDistance(pTarget));
+                SayInParty(std::string("Can't reach ") + pTarget->GetName() + " for " + pSpellEntry->SpellName[0] +
+                    " from my spot.");
+                m_ccOutOfReachGuid = pTarget->GetObjectGuid();
+            }
+            continue;
+        }
+
         float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
         if (WalkIntoRange(pTarget, range, "CC", pSpellEntry->SpellName[0].c_str()))
             return true;
@@ -795,9 +841,18 @@ bool PartyBotAI::HasPendingCCMark() const
 
     for (auto mark : m_marksToCC)
         if (Unit const* pTarget = GetMarkedTarget(mark))
-            if (IsCCMarkPending(pTarget))
+            if (IsCCMarkPending(pTarget) && (!m_holdPosition || IsInCrowdControlReach(pTarget)))
                 return true;
     return false;
+}
+
+bool PartyBotAI::IsInCrowdControlReach(Unit const* pTarget) const
+{
+    SpellEntry const* pSpellEntry = GetCrowdControlSpellFor(pTarget);
+    if (!pSpellEntry)
+        return false;
+    float const range = Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex));
+    return me->IsWithinDistInMap(pTarget, range - 2.0f) && me->IsWithinLOSInMap(pTarget);
 }
 
 void PartyBotAI::ReleaseCCMark(Unit* pTarget, SpellEntry const* pSpellEntry, char const* why)
@@ -1268,10 +1323,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     if (IsPullWaiting())
     {
+        // Being hit does not end the wait (the tank grabs loose enemies; survival runs above).
         if (WorldTimer::getMSTimeDiffToNow(m_pullWaitStart) >= m_pullWaitDuration)
             EndPullWait("pull timer over");
-        else if (!me->GetAttackers().empty())
-            EndPullWait("attacked");
         else
         {
             UpdatePullWait();
@@ -1307,9 +1361,11 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         }
 
         // On stay: eat/drink freely. Otherwise following wins: only once near the leader
-        // (stacked: on the leader) and while the leader stands still.
+        // (stacked: on the leader), while the leader stands still, and not within 10 s of a
+        // follow order (the leader is about to move).
         bool const mayEatDrink = !groupFighting && (!mayFollow ||
             (!pLeader->IsMoving() &&
+             (!m_followOrderTime || WorldTimer::getMSTimeDiffToNow(m_followOrderTime) >= PB_FOLLOW_ORDER_NO_SIT_MS) &&
               me->IsWithinDist(pLeader, stackedFollow ? PB_STACK_DIST : PB_MAX_FOLLOW_DIST + 2.0f, true, SizeFactor::None)));
         if (mayEatDrink && DrinkAndEat())
         {
@@ -1710,6 +1766,7 @@ void PartyBotAI::OrderHoldSpot(uint32 mapId, float x, float y, float z)
 
 void PartyBotAI::OrderFollow()
 {
+    m_followOrderTime = WorldTimer::getMSTime();
     ClearOrderedTarget();
     EndPullWait("follow order");
     SetHoldPosition(false);
@@ -1719,6 +1776,7 @@ void PartyBotAI::OrderFollow()
 
 void PartyBotAI::OrderStackedFollow(bool stacked)
 {
+    m_followOrderTime = WorldTimer::getMSTime();
     ClearOrderedTarget();
     EndPullWait("toggle order");
     SetHoldPosition(false);
@@ -2053,7 +2111,8 @@ bool PartyBotAI::ShouldBandage(char const*& why) const
     switch (m_role)
     {
         case ROLE_TANK:
-            if (me->GetVictim() || healthPct >= PB_BANDAGE_HEALTH_PCT)
+            // Not while anything still fights the group (it may need the tank any second).
+            if (me->GetVictim() || healthPct >= PB_BANDAGE_HEALTH_PCT || SelectPartyAttackTarget())
                 return false;
             why = "tank, no target";
             return true;
@@ -2863,18 +2922,21 @@ bool PartyBotAI::IsBossTarget(Unit const* pUnit) const
     return false;
 }
 
+// The boss owner is the highest-slot tank (MT, then OT1...) that is alive within 50 yd and in
+// control of itself: a disoriented (Conflagration), feared or stunned MT hands the boss to OT1.
 bool PartyBotAI::IsBossTankOwner(PartyBotTankSlotMap const& slots) const
 {
+    uint8 const mySlot = GetSlotOf(slots, me);
     for (auto const& itr : slots)
     {
-        if (itr.second != PB_TANK_SLOT_MT)
+        if (itr.first == me->GetObjectGuid() || (mySlot != PB_TANK_SLOT_NONE && itr.second >= mySlot))
             continue;
-        if (itr.first == me->GetObjectGuid())
-            return true;
-        Player const* pMainTank = ObjectAccessor::FindPlayer(itr.first);
-        return !(pMainTank && pMainTank->IsAlive() && pMainTank->IsInMap(me) && me->IsWithinDist(pMainTank, 50.0f));
+        Player const* pTank = ObjectAccessor::FindPlayer(itr.first);
+        if (pTank && pTank->IsAlive() && pTank->IsInMap(me) && me->IsWithinDist(pTank, 50.0f) &&
+           !pTank->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+            return false; // a higher tank can take it
     }
-    return true; // no main tank
+    return true;
 }
 
 // Nearest enemy attacking a group member without a tank slot, that no other tank bot is

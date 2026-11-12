@@ -107,6 +107,11 @@ public:
     // already attacked by others).
     bool IsCCMarkPending(Unit const* pTarget) const;
     bool HasPendingCCMark() const;
+    // In spell range and sight of the class CC spell (a bot on stay never walks for a CC mark).
+    bool IsInCrowdControlReach(Unit const* pTarget) const;
+    // Chain spells (Multi-Shot, Chain Lightning, Cleave) obey the area-spell rules for the enemies
+    // they can jump to.
+    bool IsChainSpellSafe(Unit const* pTarget, SpellEntry const* pSpellEntry) const;
     bool EnterCombatDruidForm();
     bool ShouldEnterStealth() const;
     bool EnterStealthIfNeeded(SpellEntry const* pStealthSpell);
@@ -325,6 +330,8 @@ public:
     uint8 m_loggedTankSlot = PB_TANK_SLOT_NONE;
     ObjectGuid m_heldBossGuid;                   // boss this tank stays on (logged once)
     ObjectGuid m_looseAddLoggedGuid;             // loose add left to the group while holding a boss (logged once)
+    ObjectGuid m_ccOutOfReachGuid;               // CC mark out of reach while on stay (logged once)
+    uint32 m_followOrderTime = 0;                // last follow/toggle order: no sitting down for a while
     mutable PartyBotTankSlotMap m_tankSlotCache;
     mutable uint32 m_tankSlotCacheTime = 0;
     PartyBotLayer m_activeLayer = PB_LAYER_NONE;
