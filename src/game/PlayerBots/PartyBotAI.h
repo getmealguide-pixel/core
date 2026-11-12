@@ -234,6 +234,15 @@ public:
     void RepairGear(char const* why);
     void CommandPetAttack(Unit* pVictim);
 
+    // Task 18b shared interrupts: one check for every class, before the rotations. Any enemy
+    // fighting the group that casts an interruptible spell is interrupted once (shared claim
+    // list); short-cooldown interrupts first. Healers never interrupt; bots never move for it.
+    // Log "[Interrupt]".
+    bool UpdateInterrupts();
+    // This bot's usable interrupt (ready, in range, in sight) on pCaster, or nullptr.
+    SpellEntry const* GetReadyInterrupt(Unit* pCaster, bool shortCooldownOnly) const;
+    // Another bot of the group could interrupt pCaster now with a short-cooldown interrupt.
+    bool GroupHasShortInterruptReady(Unit* pCaster) const;
     bool CheckForDispelTargets();
     void UpdateInCombatAI() final;
     void UpdateOutOfCombatAI() final;

@@ -3148,8 +3148,200 @@ void PartyBotAI::UpdateForcedAoE()
         EndForcedAoE("fight over");
 }
 
+// Task 18b shared interrupts.
+// Interrupts with a cooldown above this are "long" (Counterspell, Silence, Bash): used only when
+// no short one (Kick, Pummel, Shield Bash, Earth Shock) of the group is ready for that cast.
+static uint32 const PB_INTERRUPT_LONG_COOLDOWN = 15 * IN_MILLISECONDS;
+// A long interrupt still fires when less than this is left of the cast.
+static uint32 const PB_INTERRUPT_LAST_CHANCE = 1 * IN_MILLISECONDS;
+// How long a claimed cast stays reserved for the bot that interrupted it.
+static uint32 const PB_INTERRUPT_CLAIM_TIME = 1500;
+
+struct PartyBotInterruptClaim
+{
+    ObjectGuid botGuid;
+    uint32 spellId;
+    uint32 claimTime;
+};
+// Enemy caster -> the bot that interrupted its current cast. Shared by all bots (map threads).
+static std::mutex s_interruptClaimsLock;
+static std::map<ObjectGuid, PartyBotInterruptClaim> s_interruptClaims;
+
+// The enemy's cast that an interrupt would stop (same rule as Spell::EffectInterruptCast:
+// silence-type spells with a cast time, or channels that actions cancel), or nullptr.
+static Spell const* GetInterruptibleCast(Unit const* pCaster)
+{
+    if (Spell const* pSpell = pCaster->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+    {
+        if (pSpell->GetCastTime() > 0 && pSpell->getState() == SPELL_STATE_PREPARING &&
+            pSpell->m_spellInfo->PreventionType == SPELL_PREVENTION_TYPE_SILENCE &&
+            pSpell->m_spellInfo->HasSpellInterruptFlag(SPELL_INTERRUPT_FLAG_DAMAGE_PUSHBACK))
+            return pSpell;
+    }
+    if (Spell const* pSpell = pCaster->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+    {
+        if (pSpell->getState() == SPELL_STATE_CASTING &&
+            pSpell->m_spellInfo->PreventionType == SPELL_PREVENTION_TYPE_SILENCE &&
+            pSpell->m_spellInfo->HasChannelInterruptFlag(AURA_INTERRUPT_ACTION_CANCELS))
+            return pSpell;
+    }
+    return nullptr;
+}
+
+// True if another bot already interrupted this cast (claims of ended casts are dropped).
+static bool IsInterruptClaimed(Unit const* pCaster, uint32 spellId)
+{
+    std::lock_guard<std::mutex> guard(s_interruptClaimsLock);
+    uint32 const now = WorldTimer::getMSTime();
+    for (auto itr = s_interruptClaims.begin(); itr != s_interruptClaims.end();)
+    {
+        if (WorldTimer::getMSTimeDiff(itr->second.claimTime, now) >= PB_INTERRUPT_CLAIM_TIME)
+            itr = s_interruptClaims.erase(itr);
+        else
+            ++itr;
+    }
+    auto itr = s_interruptClaims.find(pCaster->GetObjectGuid());
+    return itr != s_interruptClaims.end() && itr->second.spellId == spellId;
+}
+
+static void ClaimInterrupt(Unit const* pCaster, uint32 spellId, ObjectGuid botGuid)
+{
+    std::lock_guard<std::mutex> guard(s_interruptClaimsLock);
+    s_interruptClaims[pCaster->GetObjectGuid()] = { botGuid, spellId, WorldTimer::getMSTime() };
+}
+
+SpellEntry const* PartyBotAI::GetReadyInterrupt(Unit* pCaster, bool shortCooldownOnly) const
+{
+    if (m_role == ROLE_HEALER || m_preventCasting)
+        return nullptr;
+
+    SpellEntry const* candidates[2] = { nullptr, nullptr };
+    switch (me->GetClass())
+    {
+        case CLASS_WARRIOR: // Pummel needs Berserker Stance, Shield Bash a shield (no stance dancing)
+            candidates[0] = m_spells.warrior.pPummel;
+            if (IsWearingShield(me))
+                candidates[1] = m_spells.warrior.pShieldBash;
+            break;
+        case CLASS_ROGUE:
+            candidates[0] = m_spells.rogue.pKick;
+            break;
+        case CLASS_SHAMAN:
+            candidates[0] = m_spells.shaman.pEarthShock;
+            break;
+        case CLASS_MAGE:
+            candidates[0] = m_spells.mage.pCounterspell;
+            break;
+        case CLASS_PRIEST:
+            candidates[0] = m_spells.priest.pSilence;
+            break;
+        case CLASS_DRUID: // Bear Form only (the shapeshift check in CanTryToCastSpell)
+            candidates[0] = m_spells.druid.pBash;
+            break;
+    }
+
+    for (SpellEntry const* pSpellEntry : candidates)
+    {
+        if (!pSpellEntry)
+            continue;
+        if (shortCooldownOnly &&
+            std::max(pSpellEntry->RecoveryTime, pSpellEntry->CategoryRecoveryTime) > PB_INTERRUPT_LONG_COOLDOWN)
+            continue;
+        if (CanTryToCastSpell(pCaster, pSpellEntry) && me->IsWithinLOSInMap(pCaster))
+            return pSpellEntry;
+    }
+    return nullptr;
+}
+
+bool PartyBotAI::GroupHasShortInterruptReady(Unit* pCaster) const
+{
+    Group* pGroup = me->GetGroup();
+    if (!pGroup)
+        return false;
+
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || pMember == me || !pMember->IsAlive() || !pMember->IsInWorld() ||
+            pMember->GetMap() != me->GetMap() || pMember->IsNonMeleeSpellCasted(false, false, true))
+            continue;
+
+        if (PartyBotAI const* pAI = dynamic_cast<PartyBotAI const*>(pMember->AI()))
+        {
+            if (!pAI->IsPullWaiting() && pAI->GetReadyInterrupt(pCaster, true))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool PartyBotAI::UpdateInterrupts()
+{
+    if (m_role == ROLE_HEALER || m_preventCasting)
+        return false;
+
+    Group* pGroup = me->GetGroup();
+    if (!pGroup)
+        return false;
+
+    // Enemies fighting the group: everyone attacking a member, and every member's target.
+    // Own target first.
+    std::vector<Unit*> enemies;
+    auto addEnemy = [&](Unit* pUnit)
+    {
+        if (pUnit && pUnit->IsAlive() && std::find(enemies.begin(), enemies.end(), pUnit) == enemies.end())
+            enemies.push_back(pUnit);
+    };
+    addEnemy(me->GetVictim());
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || !pMember->IsInWorld() || pMember->GetMap() != me->GetMap())
+            continue;
+        addEnemy(pMember->GetVictim());
+        for (Unit* pAttacker : pMember->GetAttackers())
+            addEnemy(pAttacker);
+    }
+
+    for (Unit* pCaster : enemies)
+    {
+        // Under crowd control or a CC mark: left to the crowd control.
+        if (!IsValidHostileTarget(pCaster) || IsForbiddenTarget(pCaster))
+            continue;
+
+        Spell const* pCast = GetInterruptibleCast(pCaster);
+        if (!pCast || IsInterruptClaimed(pCaster, pCast->m_spellInfo->Id))
+            continue;
+
+        SpellEntry const* pInterrupt = GetReadyInterrupt(pCaster, false);
+        if (!pInterrupt)
+            continue;
+
+        // Long cooldown: leave the cast to a short interrupt of the group, unless it is about to land.
+        if (std::max(pInterrupt->RecoveryTime, pInterrupt->CategoryRecoveryTime) > PB_INTERRUPT_LONG_COOLDOWN &&
+            pCast->GetCastedTime() > PB_INTERRUPT_LAST_CHANCE && GroupHasShortInterruptReady(pCaster))
+            continue;
+
+        uint32 const castSpellId = pCast->m_spellInfo->Id;
+        std::string const castName = pCast->m_spellInfo->SpellName[0];
+        uint32 const timeLeft = pCast->GetCastedTime();
+        if (DoCastSpell(pCaster, pInterrupt) == SPELL_CAST_OK)
+        {
+            ClaimInterrupt(pCaster, castSpellId, me->GetObjectGuid());
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Interrupt] %s: %s -> %s (%s, %.1f s left)%s", me->GetName(),
+                pInterrupt->SpellName[0].c_str(), pCaster->GetName(), castName.c_str(), timeLeft / 1000.0f,
+                pCaster == me->GetVictim() ? "" : " [not own target]");
+            return true;
+        }
+    }
+    return false;
+}
+
 void PartyBotAI::UpdateInCombatAI()
 {
+    if (!IsInDuel() && UpdateInterrupts())
+        return;
+
     if (!IsInDuel())
     {
         if (m_role == ROLE_TANK)
@@ -3624,14 +3816,6 @@ void PartyBotAI::UpdateInCombatAI_Shaman()
                     return;
             }
 
-            if (m_spells.shaman.pEarthShock &&
-                pVictim->IsNonMeleeSpellCasted(false, false, true) &&
-                CanTryToCastSpell(pVictim, m_spells.shaman.pEarthShock))
-            {
-                if (DoCastSpell(pVictim, m_spells.shaman.pEarthShock) == SPELL_CAST_OK)
-                    return;
-            }
-
             if (m_spells.shaman.pFrostShock &&
                 pVictim->IsMoving() &&
                 CanTryToCastSpell(pVictim, m_spells.shaman.pFrostShock))
@@ -4036,14 +4220,6 @@ void PartyBotAI::UpdateInCombatAI_Mage()
             }
         }
 
-        if (m_spells.mage.pCounterspell &&
-            pVictim->IsNonMeleeSpellCasted(false, false, true) &&
-            CanTryToCastSpell(pVictim, m_spells.mage.pCounterspell))
-        {
-            if (DoCastSpell(pVictim, m_spells.mage.pCounterspell) == SPELL_CAST_OK)
-                return;
-        }
-
         if (m_spells.mage.pBlizzard &&
            (me->GetEnemyCountInRadiusAround(pVictim, 10.0f) > 2) &&
             CanTryToCastSpell(pVictim, m_spells.mage.pBlizzard))
@@ -4271,14 +4447,6 @@ void PartyBotAI::UpdateInCombatAI_Priest()
             CanTryToCastSpell(me, m_spells.priest.pShadowform))
         {
             if (DoCastSpell(me, m_spells.priest.pShadowform) == SPELL_CAST_OK)
-                return;
-        }
-
-        if (m_spells.priest.pSilence &&
-            pVictim->IsNonMeleeSpellCasted() &&
-            CanTryToCastSpell(pVictim, m_spells.priest.pSilence))
-        {
-            if (DoCastSpell(pVictim, m_spells.priest.pSilence) == SPELL_CAST_OK)
                 return;
         }
 
@@ -4615,24 +4783,6 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
 
     if (Unit* pVictim = me->GetVictim())
     {
-        if (pVictim->IsNonMeleeSpellCasted(false, false, true))
-        {
-            if (m_spells.warrior.pPummel &&
-                CanTryToCastSpell(pVictim, m_spells.warrior.pPummel))
-            {
-                if (DoCastSpell(pVictim, m_spells.warrior.pPummel) == SPELL_CAST_OK)
-                    return;
-            }
-
-            if (m_spells.warrior.pShieldBash &&
-                IsWearingShield(me) &&
-                CanTryToCastSpell(pVictim, m_spells.warrior.pShieldBash))
-            {
-                if (DoCastSpell(pVictim, m_spells.warrior.pShieldBash) == SPELL_CAST_OK)
-                    return;
-            }
-        }
-
         if (m_spells.warrior.pExecute &&
            (pVictim->GetHealthPercent() < 20.0f) &&
             CanTryToCastSpell(pVictim, m_spells.warrior.pExecute))
@@ -5110,23 +5260,6 @@ void PartyBotAI::UpdateInCombatAI_Rogue()
                 return;
         }
 
-        if (pVictim->IsNonMeleeSpellCasted())
-        {
-            if (m_spells.rogue.pGouge &&
-                CanTryToCastSpell(pVictim, m_spells.rogue.pGouge))
-            {
-                if (DoCastSpell(pVictim, m_spells.rogue.pGouge) == SPELL_CAST_OK)
-                    return;
-            }
-
-            if (m_spells.rogue.pKick &&
-                CanTryToCastSpell(pVictim, m_spells.rogue.pKick))
-            {
-                if (DoCastSpell(pVictim, m_spells.rogue.pKick) == SPELL_CAST_OK)
-                    return;
-            }
-        }
-
         if (!me->HasAuraType(SPELL_AURA_MOD_STEALTH))
         {
             if (m_spells.rogue.pEvasion &&
@@ -5522,13 +5655,6 @@ void PartyBotAI::UpdateInCombatAI_Druid()
                 CanTryToCastSpell(pVictim, m_spells.druid.pFeralCharge))
             {
                 if (DoCastSpell(pVictim, m_spells.druid.pFeralCharge) == SPELL_CAST_OK)
-                    return;
-            }
-
-            if (m_spells.druid.pBash &&
-                CanTryToCastSpell(pVictim, m_spells.druid.pBash))
-            {
-                if (DoCastSpell(pVictim, m_spells.druid.pBash) == SPELL_CAST_OK)
                     return;
             }
 
