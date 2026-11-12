@@ -28,6 +28,7 @@
 #include "SpellAuras.h"
 #include "Chat.h"
 #include "Utilities/Random.h"
+#include "PathFinder.h"
 
 #include <mutex>
 #include <random>
@@ -179,6 +180,12 @@ enum PartyBotSpells
 #define PB_FOLLOW_ORDER_NO_SIT_MS 10000
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
 #define PB_URGENT_HEAL_PCT 50.0f   // healers heal before crowd control below this (19d)
+#define PB_STEP_BACK_TRIGGER 8.0f         // B7: hunter dead zone (no Auto Shot closer than this)
+#define PB_STEP_BACK_DISTANCE 15.0f       // B7: spot this far from the target (~12 yd walk)
+#define PB_STEP_BACK_INTERVAL 3000        // B7: at most one try per 3 s
+#define PB_STEP_BACK_MAX_TIME 5000        // B7: a step back that takes longer is over
+#define PB_STEP_BACK_CC_CLEARANCE 10.0f   // B7: spot this far from CC'd / CC-marked enemies
+#define PB_STEP_BACK_AGGRO_CLEARANCE 20.0f // B7: spot this far from enemies not fighting yet
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
 #define PB_AUTO_AOE_RADIUS 10.0f     // pack size = enemies within this of the target (incl. the target)
 #define PB_AOE_CC_MARK_RANGE 40.0f   // no auto AoE while a CC-marked enemy is this close
@@ -402,6 +409,10 @@ bool PartyBotAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpell
         if (me->IsMoving() || (pLeader && pLeader->IsMoving()))
             return false;
     }
+
+    // B7 hunter stepping back: only instant spells (a cast would stop the walk).
+    if ((pSpellEntry->IsChanneledSpell() || pSpellEntry->GetCastTime(me) > 0) && IsSteppingBack())
+        return false;
 
     if (pSpellEntry->IsAreaOfEffectSpell() && !pSpellEntry->IsPositiveSpell() && !IsInDuel())
     {
@@ -4271,6 +4282,96 @@ void PartyBotAI::UpdateOutOfCombatAI_Hunter()
         SummonPetIfNeeded();
 }
 
+bool PartyBotAI::IsSteppingBack() const
+{
+    return m_steppingBack && WorldTimer::getMSTimeDiffToNow(m_stepBackTime) < PB_STEP_BACK_MAX_TIME &&
+        me->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+}
+
+bool PartyBotAI::IsSafeStepBackSpot(Unit const* pVictim, float x, float y, float z,
+    std::list<Unit*> const& enemies) const
+{
+    if (!pVictim->IsWithinLOS(x, y, z))
+        return false;
+
+    for (auto const& pEnemy : enemies)
+    {
+        if (!pEnemy->IsAlive())
+            continue;
+        float const distance = pEnemy->GetDistance(x, y, z);
+        if (distance < PB_STEP_BACK_CC_CLEARANCE &&
+           (pEnemy->HasBreakableByDamageCrowdControlAura() || IsForbiddenTarget(pEnemy)))
+            return false;
+        if (distance < PB_STEP_BACK_AGGRO_CLEARANCE && !pEnemy->IsInCombat() &&
+           (pEnemy->GetLevel() + 5) > me->GetLevel() && pEnemy->IsValidAttackTarget(me))
+            return false;
+    }
+
+    // Walkable and no long detour (cliffs, walls).
+    PathFinder path(me);
+    path.ExcludeSteepSlopes();
+    path.calculate(x, y, z);
+    if (!(path.getPathType() & PATHFIND_NORMAL))
+        return false;
+    return path.Length() <= me->GetDistance(x, y, z, SizeFactor::None) * 1.5f + 3.0f;
+}
+
+bool PartyBotAI::HunterStepBack(Unit* pVictim)
+{
+    if (m_steppingBack && !IsSteppingBack())
+        m_steppingBack = false;
+
+    if (m_role != ROLE_RANGE_DPS || !CanMoveOnOwn() || IsPullWaiting() || m_steppingBack ||
+        me->GetCombatDistance(pVictim) >= PB_STEP_BACK_TRIGGER || pVictim->GetVictim() == me ||
+        (m_stepBackTime && WorldTimer::getMSTimeDiffToNow(m_stepBackTime) < PB_STEP_BACK_INTERVAL))
+        return false;
+
+    // An enemy that attacks the hunter would only follow: stock melee until the tank takes it.
+    for (auto const& pAttacker : me->GetAttackers())
+        if (me->GetCombatDistance(pAttacker) < PB_STEP_BACK_TRIGGER)
+            return false;
+
+    m_stepBackTime = WorldTimer::getMSTime();
+
+    std::list<Unit*> enemies;
+    me->GetEnemyListInRadiusAround(me, PB_STEP_BACK_DISTANCE + PB_STEP_BACK_AGGRO_CLEARANCE + 10.0f, enemies);
+
+    // Away from the target, towards the leader (straight away when the leader stands at the target);
+    // then up to 60 degrees to either side.
+    Player* pLeader = GetPartyLeader();
+    float const baseAngle = pLeader && !pLeader->IsWithinDist(pVictim, PB_STEP_BACK_TRIGGER) ?
+        pVictim->GetAngle(pLeader) : pVictim->GetAngle(me);
+    static float const offsets[] = { 0.0f, M_PI_F / 6, -M_PI_F / 6, M_PI_F / 3, -M_PI_F / 3 };
+    for (float offset : offsets)
+    {
+        float const angle = baseAngle + offset;
+        float x = pVictim->GetPositionX() + PB_STEP_BACK_DISTANCE * cos(angle);
+        float y = pVictim->GetPositionY() + PB_STEP_BACK_DISTANCE * sin(angle);
+        float z = me->GetPositionZ();
+        me->UpdateAllowedPositionZ(x, y, z);
+        if (!IsSafeStepBackSpot(pVictim, x, y, z, enemies))
+            continue;
+
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: steps back from %s (%.0f yd, on %s) -> %.0f yd",
+            me->GetName(), GetLogName(pVictim).c_str(), me->GetCombatDistance(pVictim),
+            pVictim->GetVictim() ? GetLogName(pVictim->GetVictim()).c_str() : "nobody", PB_STEP_BACK_DISTANCE);
+        m_steppingBack = true;
+        m_stepBackFailGuid.Clear();
+        if (me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            me->InterruptSpell(CURRENT_GENERIC_SPELL);
+        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+        return true;
+    }
+
+    if (m_stepBackFailGuid != pVictim->GetObjectGuid())
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: no safe spot to step back from %s, stays",
+            me->GetName(), GetLogName(pVictim).c_str());
+        m_stepBackFailGuid = pVictim->GetObjectGuid();
+    }
+    return false;
+}
+
 void PartyBotAI::UpdateInCombatAI_Hunter()
 {
     MaintainHunterPet();
@@ -4278,6 +4379,14 @@ void PartyBotAI::UpdateInCombatAI_Hunter()
     if (Unit* pVictim = me->GetVictim())
     {
         CommandPetAttack(pVictim);
+
+        // Walking away: instant shots only (CanTryToCastSpell), no melee strikes.
+        if (HunterStepBack(pVictim) || IsSteppingBack())
+        {
+            if (m_spells.hunter.pArcaneShot && CanTryToCastSpell(pVictim, m_spells.hunter.pArcaneShot))
+                DoCastSpell(pVictim, m_spells.hunter.pArcaneShot);
+            return;
+        }
 
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && me->GetDistance(pVictim) > 30.0f)

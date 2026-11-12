@@ -237,6 +237,13 @@ public:
     void UpdateForcedAoE();
 
     void MaintainHunterPet();
+    // B7: a ranged hunter whose target is in its melee dead zone (< 8 yd) but fighting someone else
+    // walks ~12 yd away (towards the leader) and shoots again. Not on stay/toggle or during the pull
+    // wait, not while an enemy that attacks the hunter is that close; the spot must be reachable, in
+    // sight of the target, away from CC'd/CC-marked enemies and from enemies not fighting yet.
+    bool HunterStepBack(Unit* pVictim);
+    bool IsSafeStepBackSpot(Unit const* pVictim, float x, float y, float z, std::list<Unit*> const& enemies) const;
+    bool IsSteppingBack() const;
     // Task 16b: mage own mana gem (kept out of combat, used in combat).
     void KeepManaGem();
     bool UseManaGem();
@@ -341,6 +348,9 @@ public:
     uint32 m_ccCastTime = 0;                     // its cast time (ms)
     float m_ccCastX = 0.0f;                      // bot position at cast start (moved = cancel reason)
     float m_ccCastY = 0.0f;
+    uint32 m_stepBackTime = 0;                   // B7: last step-back try (ms), 0 = none
+    bool m_steppingBack = false;                 // B7: walking to the step-back spot
+    ObjectGuid m_stepBackFailGuid;               // B7: "no safe spot" logged once for this target
     ObjectGuid m_ccFailGuid;                     // last failed CC cast: target and result (logged once)
     uint32 m_ccFailResult = 0;
     ObjectGuid m_approachGuid;                   // enemy this bot walks towards (CC, ranged pull)
