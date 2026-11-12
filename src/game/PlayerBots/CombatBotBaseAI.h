@@ -115,6 +115,7 @@ public:
     bool IsValidBuffTarget(Unit const* pTarget, SpellEntry const* pSpellEntry) const;
     bool IsValidHealTarget(Unit const* pTarget, float healthPercent = 100.0f) const;
     bool IsValidHostileTarget(Unit const* pTarget) const;
+    ObjectGuid m_breakCCTargetGuid;              // ordered attack: this enemy is valid even while crowd-controlled
     bool IsValidDispelTarget(Unit const* pTarget, SpellEntry const* pSpellEntry) const;
     bool FindAndPreHealTarget();
     bool FindAndHealInjuredAlly(float selfHealPercent = 100.0f, float groupHealPercent = 100.0f);
@@ -424,6 +425,7 @@ public:
             SpellEntry const* pRaptorStrike;
             SpellEntry const* pDisengage;
             SpellEntry const* pFeignDeath;
+            SpellEntry const* pDistractingShot;
             SpellEntry const* pScareBeast;
             SpellEntry const* pVolley;
         } hunter;

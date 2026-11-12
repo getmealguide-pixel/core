@@ -3465,7 +3465,10 @@ void Aura::HandleFeignDeath(bool apply, bool Real)
     bool success = true;
     Unit* pTarget = GetTarget();
 
-    if (apply)
+    // Playerbot change (19g, F3 kiting): a party bot's Feign Death is never resisted.
+    bool const neverResisted = pTarget->IsPlayer() && static_cast<Player*>(pTarget)->IsBot();
+
+    if (apply && !neverResisted)
     {
         HostileReference* pReference = pTarget->GetHostileRefManager().getFirst();
         while (pReference)

@@ -60,6 +60,17 @@ enum PartyBotTankSlot : uint8
 
 typedef std::map<ObjectGuid, uint8> PartyBotTankSlotMap;
 
+// F3 kite steps: take the boss, run the path out, wait at its end, Feign Death, run back.
+enum PartyBotKitePhase : uint8
+{
+    PB_KITE_NONE,
+    PB_KITE_TAKE,
+    PB_KITE_OUT,
+    PB_KITE_END,
+    PB_KITE_FEIGN,
+    PB_KITE_BACK,
+};
+
 struct PlayerPremadeSpecTemplate;
 
 class PartyBotAI : public CombatBotBaseAI
@@ -151,6 +162,7 @@ public:
     // B1 diagnostics: logs whether this bot's last CC cast landed, was cancelled or did not land.
     // replaced: a new CC cast already started (judged at once, not when casting stops).
     void UpdateCCCastOutcome(bool replaced = false);
+    void UpdateDiagnostics();
     void OnCastStarted(Unit* pTarget, SpellEntry const* pSpellEntry) final;
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
@@ -196,6 +208,21 @@ public:
     // The bot cannot crowd-control this enemy (creature type or immunity): it says so once in
     // party chat and the enemy is attacked normally.
     void ReleaseCCMark(Unit* pTarget, SpellEntry const* pSpellEntry, char const* why);
+    void ReleaseCCMarkForAttackOrder(Unit* pTarget);
+
+    // F3 kiting (19g): the leader records a one-way path per map (saved to kitepath_map<id>.txt in
+    // the server folder); a hunter set as kiter takes the boss, runs the path, Feign Deaths at its
+    // end and runs it back.
+    static void UpdateKitePathRecordings();          // every world tick (PlayerBotMgr::Update)
+    static void StartKitePathRecording(Player* pLeader);
+    static int32 SaveKitePathRecording(Player* pLeader); // points saved, -1 = not recording, -2 = file error
+    static bool ClearKitePath(uint32 mapId);
+    static uint32 GetKitePathSize(uint32 mapId);
+    void SetKiter(bool on);
+    bool IsKiter() const { return m_kiter; }
+    Player* GetKiterOf(Unit const* pEnemy) const;   // group bot kiting this enemy, if any
+    bool IsKiteCandidate(Unit const* pBoss) const;
+    char const* StartKitePull(Unit* pBoss);         // nullptr = started, else why not
     void SayInParty(std::string const& text) const;
     // Loose enemies: any, bosses only (claims by other tanks ignored), or no bosses.
     enum LooseBossFilter { PB_LOOSE_ANY, PB_LOOSE_BOSSES_ONLY, PB_LOOSE_NO_BOSSES };
@@ -320,6 +347,11 @@ public:
     bool m_leaderWasMoving = false;
     bool m_wasInCombat = false;
     bool m_wasDead = false;                      // revive -> repair
+    bool m_diagAlive = true;                     // B12 diagnostics: last seen alive state
+    bool m_diagInControl = true;                 // B12: tank last seen in control
+    uint32 m_diagLostControlTime = 0;            // B12: when the tank lost control (ms)
+    ObjectGuid m_diagLastAttackerGuid;           // B12: enemy last hitting this bot
+    std::map<ObjectGuid, ObjectGuid> m_diagBossVictims; // B12: boss -> victim last logged
     bool m_supplyBagFullLogged = false;          // "bags full" logged this fight
     uint32 m_bandageSpellId = 0;                 // spell of the bandage being channeled, 0 = none
     ObjectGuid m_bandageTargetGuid;              // enemy attacked before bandaging (re-attacked after)
@@ -351,6 +383,19 @@ public:
     float m_ccCastY = 0.0f;
     uint32 m_stepBackTime = 0;                   // B7: last step-back try (ms), 0 = none
     bool m_steppingBack = false;                 // B7: walking to the step-back spot
+    bool m_kiter = false;                        // F3: this hunter kites bosses on the recorded path
+    PartyBotKitePhase m_kitePhase = PB_KITE_NONE; // F3: kite step
+    uint32 m_kitePhaseTime = 0;                  // F3: when the step began (ms)
+    ObjectGuid m_kiteTargetGuid;                 // F3: boss being kited
+    std::set<ObjectGuid> m_kiteReleased;         // F3: bosses kited or released this fight
+    int32 m_kiteIndex = -1;                      // F3: path point the kiter runs to
+    bool m_kiteWaitLogged = false;               // F3: "waits, boss ahead" logged once per wait
+    bool m_kiteDistracted = false;               // F3: Distracting Shot used since taking the boss
+    bool m_kiteNoPathLogged = false;             // F3: "no kite path" logged once
+    bool UpdateKite();
+    void UpdateKiteMovement();                   // every tick: path running, getting up
+    void SetKitePhase(PartyBotKitePhase phase);
+    void EndKite(char const* why);
     ObjectGuid m_stepBackFailGuid;               // B7: "no safe spot" logged once for this target
     ObjectGuid m_ccIdleLoggedGuid;               // CC mark not fighting yet, no pull order (logged once)
     ObjectGuid m_ccFailGuid;                     // last failed CC cast: target and result (logged once)

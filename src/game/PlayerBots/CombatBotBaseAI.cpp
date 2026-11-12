@@ -654,6 +654,11 @@ void CombatBotBaseAI::PopulateSpellData()
                     if (IsHigherRankSpell(m_spells.hunter.pDisengage))
                         m_spells.hunter.pDisengage = pSpellEntry;
                 }
+                else if (pSpellEntry->SpellName[0].find("Distracting Shot") != std::string::npos)
+                {
+                    if (IsHigherRankSpell(m_spells.hunter.pDistractingShot))
+                        m_spells.hunter.pDistractingShot = pSpellEntry;
+                }
                 else if (pSpellEntry->SpellName[0].find("Feign Death") != std::string::npos)
                 {
                     if (IsHigherRankSpell(m_spells.hunter.pFeignDeath))
@@ -2198,7 +2203,7 @@ bool CombatBotBaseAI::IsValidHostileTarget(Unit const* pTarget) const
 {
     return me->IsValidAttackTarget(pTarget) &&
            pTarget->IsVisibleForOrDetect(me, me, false) &&
-           !pTarget->HasBreakableByDamageCrowdControlAura() &&
+          (!pTarget->HasBreakableByDamageCrowdControlAura() || pTarget->GetObjectGuid() == m_breakCCTargetGuid) &&
            !pTarget->IsTotalImmune() &&
            pTarget->GetTransport() == me->GetTransport();
 }

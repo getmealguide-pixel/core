@@ -192,6 +192,9 @@ void PlayerBotMgr::OnPlayerInWorld(Player* player)
 
 void PlayerBotMgr::Update(uint32 diff)
 {
+    // F3: kite path recordings follow their leader every world tick (bots not needed).
+    PartyBotAI::UpdateKitePathRecordings();
+
     // Temporary bots.
     std::map<uint32, uint32>::iterator it;
     for (it = m_tempBots.begin(); it != m_tempBots.end(); ++it)
@@ -1453,6 +1456,137 @@ bool ChatHandler::HandlePartyBotSingleFocusCommand(char* args)
     return HandlePartyBotOnOffHelper(args, "singlefocus", PB_SETTING_SINGLE_FOCUS);
 }
 
+// .partybot kitepath record|save|clear|info (F3): the one-way kite path of the current map. While
+// recording, the leader's position is noted every few yards; save ends the path where the leader
+// stands and writes kitepath_map<id>.txt.
+bool ChatHandler::HandlePartyBotKitePathCommand(char* args)
+{
+    Player* pPlayer = GetSession()->GetPlayer();
+    std::string const arg = args ? args : "";
+    if (arg == "record")
+    {
+        PartyBotAI::StartKitePathRecording(pPlayer);
+        SendSysMessage("Recording the kite path from here: walk to the end spot, then type .partybot kitepath save");
+        return true;
+    }
+    if (arg == "save")
+    {
+        int32 const points = PartyBotAI::SaveKitePathRecording(pPlayer);
+        if (points < 0)
+        {
+            SendSysMessage(points == -1 ? "Not recording. Start with .partybot kitepath record" : "Could not write the kite path file.");
+            SetSentErrorMessage(true);
+            return false;
+        }
+        PSendSysMessage("Kite path saved for this map: %i points.", points);
+        return true;
+    }
+    if (arg == "clear")
+    {
+        PSendSysMessage(PartyBotAI::ClearKitePath(pPlayer->GetMapId()) ? "Kite path of this map deleted." : "This map has no kite path.");
+        return true;
+    }
+    if (arg.empty() || arg == "info")
+    {
+        PSendSysMessage("Kite path on this map: %u points.", PartyBotAI::GetKitePathSize(pPlayer->GetMapId()));
+        return true;
+    }
+    return false;
+}
+
+// .partybot kiter pull (F3), boss selected: the group's kiter opens on the boss (Aimed Shot, then
+// Distracting Shot); damage dealers wait like on a pull, healers CC their marks; tanks get no order
+// (they take the adds that come to the group and never touch the kited boss).
+bool ChatHandler::HandlePartyBotKiterPullHelper()
+{
+    Player* pPlayer = GetSession()->GetPlayer();
+    Unit* pBoss = GetSelectedUnit();
+    Group* pGroup = pPlayer->GetGroup();
+    if (!pBoss || pBoss == pPlayer || !pPlayer->IsValidAttackTarget(pBoss, true) || !pGroup)
+    {
+        SendSysMessage("Select the boss (and be in a group with your kiter).");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    PartyBotAI* pKiterAI = nullptr;
+    Player* pKiter = nullptr;
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr && !pKiterAI; itr = itr->next())
+        if (Player* pMember = itr->getSource())
+            if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
+                if (pAI->IsKiter() && pMember->IsAlive())
+                {
+                    pKiterAI = pAI;
+                    pKiter = pMember;
+                }
+    if (!pKiterAI)
+    {
+        SendSysMessage("No kiter: click your hunter bot and type .partybot kiter on");
+        SetSentErrorMessage(true);
+        return false;
+    }
+    if (char const* why = pKiterAI->StartKitePull(pBoss))
+    {
+        PSendSysMessage("%s cannot kite %s: %s.", pKiter->GetName(), pBoss->GetName(), why);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    uint32 const duration = 10 * IN_MILLISECONDS;
+    std::string paused, healerCC;
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || pMember == pPlayer || pMember == pKiter)
+            continue;
+        PartyBotAI* pAI = GetCommandedPartyBotAI(pMember);
+        if (!pAI)
+            continue;
+        if (pAI->m_role == ROLE_MELEE_DPS || pAI->m_role == ROLE_RANGE_DPS)
+        {
+            pAI->StartPullWait(duration);
+            paused += paused.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
+        }
+        else if (pAI->m_role == ROLE_HEALER && pAI->HasPendingCCMark())
+        {
+            pAI->StartHealerPullCC(duration);
+            healerCC += healerCC.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
+        }
+    }
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: kiter pull %s, kiter %s, DPS paused 10 s: %s, healer CC: %s",
+        pPlayer->GetName(), CombatBotBaseAI::GetLogName(pBoss).c_str(), pKiter->GetName(),
+        paused.empty() ? "none" : paused.c_str(), healerCC.empty() ? "none" : healerCC.c_str());
+    PSendSysMessage("%s pulls and kites %s. DPS party bots are paused for 10 seconds; tanks take the adds.",
+        pKiter->GetName(), pBoss->GetName());
+    return true;
+}
+
+// .partybot kiter [on|off|pull] (F3): on/off for the selected hunter bot; pull: see above.
+bool ChatHandler::HandlePartyBotKiterCommand(char* args)
+{
+    if (args && std::string(args) == "pull")
+        return HandlePartyBotKiterPullHelper();
+
+    Player* pTarget = GetSelectedPlayer();
+    PartyBotAI* pAI = pTarget ? dynamic_cast<PartyBotAI*>(pTarget->AI()) : nullptr;
+    if (!pAI || pTarget->GetClass() != CLASS_HUNTER)
+    {
+        SendSysMessage("Select a hunter party bot.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+    std::string const arg = args ? args : "";
+    if (!arg.empty() && arg != "on" && arg != "off")
+        return false;
+    bool const on = arg.empty() ? !pAI->IsKiter() : arg == "on";
+    GetCommandedPartyBotAI(pTarget);
+    pAI->SetKiter(on);
+    PSendSysMessage("%s %s kite bosses (kite path on this map: %u points).", pTarget->GetName(), on ? "will" : "will not",
+        PartyBotAI::GetKitePathSize(pTarget->GetMapId()));
+    return true;
+}
+
 bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
 {
     Player* pPlayer = GetSession()->GetPlayer();
@@ -1485,6 +1619,7 @@ bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
             {
                 if (PartyBotAI* pAI = GetCommandedPartyBotAI(pMember))
                 {
+                    pAI->ReleaseCCMarkForAttackOrder(pTarget);
                     if (pAI->GetRole() != ROLE_HEALER && pMember->IsValidAttackTarget(pTarget))
                     {
                         pAI->OrderAttack(pTarget, true);
@@ -2386,6 +2521,17 @@ bool ChatHandler::HandlePartyBotPullHelper(char* args, bool ranged)
     if (!pGroup)
     {
         SendSysMessage("You are not in a group.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // B9: a pull never breaks crowd control (bots would ignore the target): say so, change nothing.
+    if (pTarget->HasBreakableByDamageCrowdControlAura())
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: pull %s refused (crowd-controlled, use attack)",
+            pPlayer->GetName(), CombatBotBaseAI::GetLogName(pTarget).c_str());
+        PSendSysMessage("%s is crowd-controlled: a pull would not break it. Use attack to break it and fight it.",
+            pTarget->GetName());
         SetSentErrorMessage(true);
         return false;
     }
