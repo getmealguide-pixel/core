@@ -815,20 +815,12 @@ bool PartyBotAI::CrowdControlMarkedTargets()
         if (!CanTryToCastSpell(pTarget, pSpellEntry))
             continue;
 
-        // The previous CC cast may have ended after this tick's outcome check: judge it first.
-        if (m_ccCastSpellId)
-            UpdateCCCastOutcome();
-
+        m_ccCastForMark = true;                  // OnCastStarted: source "mark"
         SpellCastResult const result = DoCastSpell(pTarget, pSpellEntry);
+        m_ccCastForMark = false;
         if (result == SPELL_CAST_OK)
         {
             me->ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
-            m_ccCastSpellId = pSpellEntry->Id;
-            m_ccCastTargetGuid = pTarget->GetObjectGuid();
-            m_ccCastStart = WorldTimer::getMSTime();
-            m_ccCastTime = pSpellEntry->GetCastTime(me);
-            m_ccCastX = me->GetPositionX();
-            m_ccCastY = me->GetPositionY();
             m_ccFailGuid.Clear();
             return true;
         }
@@ -1807,38 +1799,63 @@ bool PartyBotAI::HealsBeforeCC()
 // Once the last CC cast is no longer being cast: did its aura land on the target, was the cast
 // cancelled early (moved, interrupted, stunned...) or did it finish without landing (resisted,
 // missed, immune; bots get no hit result)?
-void PartyBotAI::UpdateCCCastOutcome()
+// Every cast of the bot's CC spell is tracked, from a CC mark or from the stock class rotation
+// (e.g. druid Hibernate on its own attacker). A new one first judges the previous one.
+void PartyBotAI::OnCastStarted(Unit* pTarget, SpellEntry const* pSpellEntry)
+{
+    bool const isCC = pSpellEntry == GetCrowdControlSpell() ||
+        (me->GetClass() == CLASS_WARLOCK && pSpellEntry == m_spells.warlock.pFear);
+    if (!isCC || pTarget == me)
+        return;
+
+    if (m_ccCastSpellId)
+        UpdateCCCastOutcome(true);
+
+    m_ccCastSpellId = pSpellEntry->Id;
+    m_ccCastSource = m_ccCastForMark ? "mark" : "stock auto-CC";
+    m_ccCastTargetGuid = pTarget->GetObjectGuid();
+    m_ccCastStart = WorldTimer::getMSTime();
+    m_ccCastTime = pSpellEntry->GetCastTime(me);
+    m_ccCastX = me->GetPositionX();
+    m_ccCastY = me->GetPositionY();
+}
+
+void PartyBotAI::UpdateCCCastOutcome(bool replaced)
 {
     if (!m_ccCastSpellId)
         return;
 
-    if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
-        if (pSpell->m_spellInfo->Id == m_ccCastSpellId && pSpell->getState() != SPELL_STATE_FINISHED)
-            return;
+    if (!replaced)
+        if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            if (pSpell->m_spellInfo->Id == m_ccCastSpellId && pSpell->getState() != SPELL_STATE_FINISHED)
+                return;
 
     uint32 const spellId = m_ccCastSpellId;
     m_ccCastSpellId = 0;
     SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(spellId);
-    char const* spellName = pSpellEntry ? pSpellEntry->SpellName[0].c_str() : "CC spell";
+    std::string const spellName = std::string(pSpellEntry ? pSpellEntry->SpellName[0].c_str() : "CC spell") +
+        " (" + m_ccCastSource + ")";
     uint32 const elapsed = WorldTimer::getMSTimeDiffToNow(m_ccCastStart);
 
     Unit* pTarget = me->GetMap()->GetUnit(m_ccCastTargetGuid);
     if (!pTarget || !pTarget->IsAlive())
     {
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s target gone (dead or despawned)", me->GetName(), spellName);
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s target gone (dead or despawned)", me->GetName(),
+            spellName.c_str());
         return;
     }
 
     std::string const target = GetLogName(pTarget);
     if (pTarget->HasAura(spellId))
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s landed on %s", me->GetName(), spellName, target.c_str());
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s landed on %s", me->GetName(), spellName.c_str(),
+            target.c_str());
     else if (elapsed + 100 < m_ccCastTime)
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s on %s cancelled after %.1f of %.1f s (moved %.1f yd)",
-            me->GetName(), spellName, target.c_str(), elapsed / 1000.0f, m_ccCastTime / 1000.0f,
-            me->GetDistance2d(m_ccCastX, m_ccCastY));
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s on %s cancelled after %.1f of %.1f s (moved %.1f yd%s)",
+            me->GetName(), spellName.c_str(), target.c_str(), elapsed / 1000.0f, m_ccCastTime / 1000.0f,
+            me->GetDistance2d(m_ccCastX, m_ccCastY), replaced ? ", replaced by a new cast" : "");
     else
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s on %s did not land (resisted, missed or immune)",
-            me->GetName(), spellName, target.c_str());
+            me->GetName(), spellName.c_str(), target.c_str());
 }
 
 // Hold a given spot (comestay: the leader's position; aedm "move here": the clicked ground);

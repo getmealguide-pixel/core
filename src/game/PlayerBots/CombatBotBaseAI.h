@@ -129,6 +129,8 @@ public:
     bool AreOthersOnSameTarget(ObjectGuid guid, bool checkMelee = true, bool checkSpells = true) const;
 
     SpellCastResult DoCastSpell(Unit* pTarget, SpellEntry const* pSpellEntry);
+    // Called by DoCastSpell for every cast that started (SPELL_CAST_OK).
+    virtual void OnCastStarted(Unit* /*pTarget*/, SpellEntry const* /*pSpellEntry*/) {}
     // Name for log lines: creatures get "#<guid counter>" so same-name enemies can be told apart.
     static std::string GetLogName(Unit const* pUnit);
     virtual bool CanTryToCastSpell(Unit const* pTarget, SpellEntry const* pSpellEntry) const;

@@ -148,7 +148,9 @@ public:
     bool IsHealerCCActive() const;
     bool HealsBeforeCC();
     // B1 diagnostics: logs whether this bot's last CC cast landed, was cancelled or did not land.
-    void UpdateCCCastOutcome();
+    // replaced: a new CC cast already started (judged at once, not when casting stops).
+    void UpdateCCCastOutcome(bool replaced = false);
+    void OnCastStarted(Unit* pTarget, SpellEntry const* pSpellEntry) final;
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
     void OrderStackedFollow(bool stacked);
@@ -332,6 +334,8 @@ public:
     bool m_groupFighting = false;                // a group member nearby is attacked, this bot not yet
     bool m_healFirstLogged = false;              // "heals first" logged until no urgent heal is needed
     uint32 m_ccCastSpellId = 0;                  // last CC cast still to be judged (0 = none)
+    char const* m_ccCastSource = "";             // "mark" or "stock auto-CC"
+    bool m_ccCastForMark = false;                // set while CrowdControlMarkedTargets casts
     ObjectGuid m_ccCastTargetGuid;
     uint32 m_ccCastStart = 0;
     uint32 m_ccCastTime = 0;                     // its cast time (ms)

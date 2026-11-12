@@ -3299,8 +3299,11 @@ SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pS
     auto result = me->CastSpell(pTarget, pSpellEntry, false);
 
     if (result == SPELL_CAST_OK)
+    {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Cast] %s: %s (%u) on %s", me->GetName(),
             pSpellEntry->SpellName[0].c_str(), pSpellEntry->Id, GetLogName(pTarget).c_str());
+        OnCastStarted(pTarget, pSpellEntry);
+    }
 
     if ((result == SPELL_FAILED_MOVING ||
         result == SPELL_CAST_OK) &&
