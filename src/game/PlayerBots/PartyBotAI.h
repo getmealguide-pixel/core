@@ -142,6 +142,13 @@ public:
     void EndPullWait(char const* why);
     bool IsPullWaiting() const { return m_pullWaitDuration != 0; }
     void UpdatePullWait();
+    // Task 19d: healers with a CC mark crowd-control it at once on pull/rpull (no wait) and while
+    // the group fights, also out of combat; an urgent heal (anyone below PB_URGENT_HEAL_PCT) first.
+    void StartHealerPullCC(uint32 duration);
+    bool IsHealerCCActive() const;
+    bool HealsBeforeCC();
+    // B1 diagnostics: logs whether this bot's last CC cast landed, was cancelled or did not land.
+    void UpdateCCCastOutcome();
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
     void OrderStackedFollow(bool stacked);
@@ -320,6 +327,18 @@ public:
     uint32 m_moveOrderTime = 0;                  // when the last move order came (for the reaction log)
     uint32 m_pullWaitStart = 0;                  // pull timer start (ms)
     uint32 m_pullWaitDuration = 0;               // pull timer length (ms), 0 = not waiting
+    uint32 m_healerPullCCStart = 0;              // healer: pull order time (CC marks at once)
+    uint32 m_healerPullCCDuration = 0;           // healer: pull timer length (ms), 0 = none
+    bool m_groupFighting = false;                // a group member nearby is attacked, this bot not yet
+    bool m_healFirstLogged = false;              // "heals first" logged until no urgent heal is needed
+    uint32 m_ccCastSpellId = 0;                  // last CC cast still to be judged (0 = none)
+    ObjectGuid m_ccCastTargetGuid;
+    uint32 m_ccCastStart = 0;
+    uint32 m_ccCastTime = 0;                     // its cast time (ms)
+    float m_ccCastX = 0.0f;                      // bot position at cast start (moved = cancel reason)
+    float m_ccCastY = 0.0f;
+    ObjectGuid m_ccFailGuid;                     // last failed CC cast: target and result (logged once)
+    uint32 m_ccFailResult = 0;
     ObjectGuid m_approachGuid;                   // enemy this bot walks towards (CC, ranged pull)
     ObjectGuid m_rangedPullGuid;                 // rpull target until it arrives
     uint32 m_rangedPullStart = 0;                // when the rpull order came

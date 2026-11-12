@@ -178,6 +178,7 @@ enum PartyBotSpells
 #define PB_HOLD_SPOT_TOLERANCE 2.0f
 #define PB_FOLLOW_ORDER_NO_SIT_MS 10000
 #define PB_HOLD_NO_PROGRESS_TIMEOUT (5 * IN_MILLISECONDS)
+#define PB_URGENT_HEAL_PCT 50.0f   // healers heal before crowd control below this (19d)
 #define PB_EAT_DRINK_START_PCT 70.0f // out of combat, sit down below this health/mana %
 #define PB_AUTO_AOE_RADIUS 10.0f     // pack size = enemies within this of the target (incl. the target)
 #define PB_AOE_CC_MARK_RANGE 40.0f   // no auto AoE while a CC-marked enemy is this close
@@ -672,7 +673,7 @@ bool PartyBotAI::WalkIntoRange(Unit* pTarget, float range, char const* tag, char
     if (m_approachGuid != pTarget->GetObjectGuid())
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[%s] %s: walks into %s range of %s (%.0f yd away%s)", tag,
-            me->GetName(), what, pTarget->GetName(), distance, inSight ? "" : ", no line of sight");
+            me->GetName(), what, GetLogName(pTarget).c_str(), distance, inSight ? "" : ", no line of sight");
         m_approachGuid = pTarget->GetObjectGuid();
         if (m_holdPosition)
             SetHoldPosition(false);
@@ -799,7 +800,7 @@ bool PartyBotAI::CrowdControlMarkedTargets()
             if (m_ccOutOfReachGuid != pTarget->GetObjectGuid())
             {
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: on stay, %s out of %s range or sight (%.0f yd), stays",
-                    me->GetName(), pTarget->GetName(), pSpellEntry->SpellName[0].c_str(), me->GetDistance(pTarget));
+                    me->GetName(), GetLogName(pTarget).c_str(), pSpellEntry->SpellName[0].c_str(), me->GetDistance(pTarget));
                 SayInParty(std::string("Can't reach ") + pTarget->GetName() + " for " + pSpellEntry->SpellName[0] +
                     " from my spot.");
                 m_ccOutOfReachGuid = pTarget->GetObjectGuid();
@@ -818,7 +819,21 @@ bool PartyBotAI::CrowdControlMarkedTargets()
         if (result == SPELL_CAST_OK)
         {
             me->ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
+            m_ccCastSpellId = pSpellEntry->Id;
+            m_ccCastTargetGuid = pTarget->GetObjectGuid();
+            m_ccCastStart = WorldTimer::getMSTime();
+            m_ccCastTime = pSpellEntry->GetCastTime(me);
+            m_ccCastX = me->GetPositionX();
+            m_ccCastY = me->GetPositionY();
+            m_ccFailGuid.Clear();
             return true;
+        }
+        if (m_ccFailGuid != pTarget->GetObjectGuid() || m_ccFailResult != uint32(result))
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s on %s fails (cast result %u)", me->GetName(),
+                pSpellEntry->SpellName[0].c_str(), GetLogName(pTarget).c_str(), uint32(result));
+            m_ccFailGuid = pTarget->GetObjectGuid();
+            m_ccFailResult = uint32(result);
         }
         if (result == SPELL_FAILED_BAD_TARGETS || result == SPELL_FAILED_IMMUNE || result == SPELL_FAILED_HIGHLEVEL)
             ReleaseCCMark(pTarget, pSpellEntry, result == SPELL_FAILED_HIGHLEVEL ? "level too high" : "not a valid target");
@@ -861,7 +876,7 @@ void PartyBotAI::ReleaseCCMark(Unit* pTarget, SpellEntry const* pSpellEntry, cha
         return;
 
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: cannot %s %s (%s), mark released, attacked normally",
-        me->GetName(), pSpellEntry->SpellName[0].c_str(), pTarget->GetName(), why);
+        me->GetName(), pSpellEntry->SpellName[0].c_str(), GetLogName(pTarget).c_str(), why);
     SayInParty(std::string("Can't ") + pSpellEntry->SpellName[0] + " " + pTarget->GetName() + " (" + why +
         ") - attacking it instead.");
 }
@@ -1080,6 +1095,9 @@ void PartyBotAI::UpdateAI(uint32 const diff)
             StandUpToFollow();
 
         FaceCombatTarget();
+
+        // Every tick, so a cancelled CC cast is timed to ~one world tick.
+        UpdateCCCastOutcome();
 
         // Entering combat (attacked, or the group pulled): think on the next tick, not after
         // the rest of the update interval.
@@ -1348,6 +1366,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
     // The group is fighting (a member within 50 yd is attacked) but this bot is not hit yet:
     // it joins the fight or heals instead of sitting down or buffing; a sitting bot stands up.
     bool const groupFighting = !me->IsInCombat() && !IsInDuel() && SelectPartyAttackTarget();
+    m_groupFighting = groupFighting;
 
     if (!me->IsInCombat())
     {
@@ -1445,7 +1464,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
             if (IsForbiddenTarget(pVictim))
             {
                 // Never hit a CC mark unless ordered to (it may be about to be crowd controlled).
-                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: leaves %s (CC mark)", me->GetName(), pVictim->GetName());
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: leaves %s (CC mark)", me->GetName(), GetLogName(pVictim).c_str());
                 me->AttackStop(true);
                 pVictim = nullptr;
             }
@@ -1457,7 +1476,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
                 if (pPreferred && pPreferred != pVictim)
                 {
                     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s)", me->GetName(),
-                        pVictim->GetName(), pPreferred->GetName(), reason);
+                        GetLogName(pVictim).c_str(), GetLogName(pPreferred).c_str(), reason);
                     me->AttackStop(true);
                     AttackStart(pPreferred);
                     return;
@@ -1474,7 +1493,7 @@ void PartyBotAI::UpdateAI(uint32 const diff)
             if (Unit* pNewVictim = SelectAttackTarget(pLeader, reason))
             {
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: picks %s (%s)", me->GetName(),
-                    pNewVictim->GetName(), reason);
+                    GetLogName(pNewVictim).c_str(), reason);
                 AttackStart(pNewVictim);
                 return;
             }
@@ -1601,7 +1620,7 @@ void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
     if (IsForbiddenTarget(pTarget))
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: will not pull %s (CC mark; use attack to override)",
-            me->GetName(), pTarget->GetName());
+            me->GetName(), GetLogName(pTarget).c_str());
         ClearOrderedTarget();
         return;
     }
@@ -1610,7 +1629,7 @@ void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
     if (m_holdPosition)
     {
         // After the fight the bot follows the leader again (it does not return to the spot).
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: leaves stay to attack %s", me->GetName(), pTarget->GetName());
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: leaves stay to attack %s", me->GetName(), GetLogName(pTarget).c_str());
         SetHoldPosition(false);
     }
 
@@ -1619,7 +1638,7 @@ void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
     {
         if (GetRangedWeaponSpell())
         {
-            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: ranged pull on %s", me->GetName(), pTarget->GetName());
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: ranged pull on %s", me->GetName(), GetLogName(pTarget).c_str());
             m_rangedPullGuid = pTarget->GetObjectGuid();
             m_rangedPullStart = WorldTimer::getMSTime();
             m_rangedPullShotTime = 0;
@@ -1631,7 +1650,7 @@ void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
             return;
         }
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: no ranged weapon, pulls %s in melee", me->GetName(),
-            pTarget->GetName());
+            GetLogName(pTarget).c_str());
     }
 
     if (me->GetVictim() && me->GetVictim() != pTarget)
@@ -1692,7 +1711,7 @@ bool PartyBotAI::UpdateRangedPull()
     if (ShootRangedWeapon(pTarget))
     {
         m_rangedPullShotTime = WorldTimer::getMSTime();
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: shot %s, waiting for it", me->GetName(), pTarget->GetName());
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: shot %s, waiting for it", me->GetName(), GetLogName(pTarget).c_str());
     }
     return true;
 }
@@ -1721,6 +1740,7 @@ void PartyBotAI::StartPullWait(uint32 duration)
 
 void PartyBotAI::EndPullWait(char const* why)
 {
+    m_healerPullCCDuration = 0;                  // any new order also ends a healer's pull CC
     if (!IsPullWaiting())
         return;
 
@@ -1741,6 +1761,80 @@ void PartyBotAI::UpdatePullWait()
         me->GetMotionMaster()->Clear(false, true);
         me->GetMotionMaster()->MoveIdle();
     }
+}
+
+void PartyBotAI::StartHealerPullCC(uint32 duration)
+{
+    m_healerPullCCStart = WorldTimer::getMSTime();
+    m_healerPullCCDuration = duration;
+}
+
+// A healer crowd-controls its marks after a pull order (for the pull timer) or while the group
+// fights; out of a fight it never starts one with crowd control.
+bool PartyBotAI::IsHealerCCActive() const
+{
+    if (m_role != ROLE_HEALER)
+        return false;
+    return m_groupFighting || me->IsInCombat() || (m_healerPullCCDuration &&
+        WorldTimer::getMSTimeDiffToNow(m_healerPullCCStart) < m_healerPullCCDuration);
+}
+
+// Healers: an ally below PB_URGENT_HEAL_PCT is healed before a pending CC mark (logged once).
+bool PartyBotAI::HealsBeforeCC()
+{
+    if (m_role != ROLE_HEALER)
+        return false;
+
+    Unit* pInjured = SelectHealTarget(PB_URGENT_HEAL_PCT, PB_URGENT_HEAL_PCT);
+    if (!pInjured)
+    {
+        m_healFirstLogged = false;
+        return false;
+    }
+    if (!m_healFirstLogged && HasPendingCCMark())
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: heals first, %s at %.0f%% (CC mark waits)", me->GetName(),
+            GetLogName(pInjured).c_str(), pInjured->GetHealthPercent());
+        m_healFirstLogged = true;
+    }
+    return true;
+}
+
+// Once the last CC cast is no longer being cast: did its aura land on the target, was the cast
+// cancelled early (moved, interrupted, stunned...) or did it finish without landing (resisted,
+// missed, immune; bots get no hit result)?
+void PartyBotAI::UpdateCCCastOutcome()
+{
+    if (!m_ccCastSpellId)
+        return;
+
+    if (Spell* pSpell = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+        if (pSpell->m_spellInfo->Id == m_ccCastSpellId && pSpell->getState() != SPELL_STATE_FINISHED)
+            return;
+
+    uint32 const spellId = m_ccCastSpellId;
+    m_ccCastSpellId = 0;
+    SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(spellId);
+    char const* spellName = pSpellEntry ? pSpellEntry->SpellName[0].c_str() : "CC spell";
+    uint32 const elapsed = WorldTimer::getMSTimeDiffToNow(m_ccCastStart);
+
+    Unit* pTarget = me->GetMap()->GetUnit(m_ccCastTargetGuid);
+    if (!pTarget || !pTarget->IsAlive())
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s target gone (dead or despawned)", me->GetName(), spellName);
+        return;
+    }
+
+    std::string const target = GetLogName(pTarget);
+    if (pTarget->HasAura(spellId))
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s landed on %s", me->GetName(), spellName, target.c_str());
+    else if (elapsed + 100 < m_ccCastTime)
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s on %s cancelled after %.1f of %.1f s (moved %.1f yd)",
+            me->GetName(), spellName, target.c_str(), elapsed / 1000.0f, m_ccCastTime / 1000.0f,
+            me->GetDistance2d(m_ccCastX, m_ccCastY));
+    else
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[CC] %s: %s on %s did not land (resisted, missed or immune)",
+            me->GetName(), spellName, target.c_str());
 }
 
 // Hold a given spot (comestay: the leader's position; aedm "move here": the clicked ground);
@@ -2178,7 +2272,7 @@ void PartyBotAI::EndBandage()
     Unit* pTarget = me->GetMap()->GetUnit(targetGuid);
     if (pTarget && IsValidHostileTarget(pTarget) && !IsForbiddenTarget(pTarget) && AttackStart(pTarget))
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Supply] %s: attacks %s again after bandaging", me->GetName(),
-            pTarget->GetName());
+            GetLogName(pTarget).c_str());
 }
 
 bool PartyBotAI::IsOnHoldSpot() const
@@ -2366,7 +2460,8 @@ void PartyBotAI::UpdateOutOfCombatAI()
                     if (DoCastSpell(pTarget, m_resurrectionSpell) == SPELL_CAST_OK)
                         return;
 
-        if (m_role != ROLE_TANK && me->GetVictim() && CrowdControlMarkedTargets())
+        if (m_role != ROLE_TANK && (me->GetVictim() || IsHealerCCActive()) && !HealsBeforeCC() &&
+            CrowdControlMarkedTargets())
             return;
     }
 
@@ -3020,7 +3115,7 @@ bool PartyBotAI::TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, 
             DoCastSpell(pEnemy, pSpellEntry) == SPELL_CAST_OK)
         {
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: taunts %s off %s", me->GetName(),
-                pEnemy->GetName(), pEnemyVictim->GetName());
+                GetLogName(pEnemy).c_str(), GetLogName(pEnemyVictim).c_str());
             return true;
         }
     }
@@ -3098,7 +3193,7 @@ Unit* PartyBotAI::TabForThreat(Unit* pVictim)
         return pVictim;
 
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: leaves %s, builds threat on %s (lead %.2f%s)",
-        me->GetName(), pVictim->GetName(), pBest->GetName(), bestLead, bestInDanger ? ", about to be pulled" : "");
+        me->GetName(), GetLogName(pVictim).c_str(), GetLogName(pBest).c_str(), bestLead, bestInDanger ? ", about to be pulled" : "");
     me->AttackStop(true);
     AttackStart(pBest);
     return pBest;
@@ -3138,7 +3233,7 @@ bool PartyBotAI::UpdateTankDuty()
         if (pVictim != pMark)
         {
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s, singlefocus)", me->GetName(),
-                pVictim ? pVictim->GetName() : "none", pMark->GetName(), markReason);
+                pVictim ? GetLogName(pVictim).c_str() : "none", GetLogName(pMark).c_str(), markReason);
             me->AttackStop(true);
             AttackStart(pMark);
         }
@@ -3158,7 +3253,7 @@ bool PartyBotAI::UpdateTankDuty()
         if (m_heldBossGuid != pVictim->GetObjectGuid())
         {
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s (%s): stays on boss %s", me->GetName(),
-                GetTankSlotName(mySlot).c_str(), pVictim->GetName());
+                GetTankSlotName(mySlot).c_str(), GetLogName(pVictim).c_str());
             m_heldBossGuid = pVictim->GetObjectGuid();
         }
         // An add no other tank goes for is left to the group (CC, damage dealers).
@@ -3166,7 +3261,7 @@ bool PartyBotAI::UpdateTankDuty()
             if (m_looseAddLoggedGuid != pLoose->GetObjectGuid())
             {
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: keeps boss %s, no free off-tank for %s (attacks %s)",
-                    me->GetName(), pVictim->GetName(), pLoose->GetName(),
+                    me->GetName(), GetLogName(pVictim).c_str(), GetLogName(pLoose).c_str(),
                     pLoose->GetVictim() ? pLoose->GetVictim()->GetName() : "nobody");
                 m_looseAddLoggedGuid = pLoose->GetObjectGuid();
             }
@@ -3179,7 +3274,7 @@ bool PartyBotAI::UpdateTankDuty()
         if (Unit* pBoss = SelectLooseEnemy(slots, PB_LOOSE_BOSSES_ONLY))
         {
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s (%s): grabs boss %s from %s", me->GetName(),
-                GetTankSlotName(mySlot).c_str(), pBoss->GetName(),
+                GetTankSlotName(mySlot).c_str(), GetLogName(pBoss).c_str(),
                 pBoss->GetVictim() ? pBoss->GetVictim()->GetName() : "nobody");
             me->AttackStop(true);
             AttackStart(pBoss);
@@ -3201,7 +3296,7 @@ bool PartyBotAI::UpdateTankDuty()
     if (pMark && pVictim != pMark && !markHeld && (pMarkVictim || !SelectLooseEnemy(slots, looseFilter)))
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Target] %s: %s -> %s (%s)", me->GetName(),
-            pVictim ? pVictim->GetName() : "none", pMark->GetName(), markReason);
+            pVictim ? GetLogName(pVictim).c_str() : "none", GetLogName(pMark).c_str(), markReason);
         me->AttackStop(true);
         AttackStart(pMark);
         return TauntIfAllowed(pMark, slots, otherTanks);
@@ -3218,7 +3313,7 @@ bool PartyBotAI::UpdateTankDuty()
             if (pLoose != pVictim)
             {
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s (%s): grabs %s from %s", me->GetName(),
-                    GetTankSlotName(mySlot).c_str(), pLoose->GetName(),
+                    GetTankSlotName(mySlot).c_str(), GetLogName(pLoose).c_str(),
                     pLoose->GetVictim() ? pLoose->GetVictim()->GetName() : "nobody");
                 me->AttackStop(true);
                 AttackStart(pLoose);
@@ -3291,7 +3386,7 @@ bool PartyBotAI::CastAreaOfEffectSpell(Unit* pTarget)
             for (auto const& pEnemy : targets)
                 if (pEnemy->HasBreakableByDamageCrowdControlAura() || IsForbiddenTarget(pEnemy))
                     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: AoE forced, CC mob hit (%s by %s)",
-                        me->GetName(), pEnemy->GetName(), pSpell->SpellName[0].c_str());
+                        me->GetName(), GetLogName(pEnemy).c_str(), pSpell->SpellName[0].c_str());
         }
         return true;
     }
@@ -3532,7 +3627,7 @@ bool PartyBotAI::UpdateInterrupts()
         {
             ClaimInterrupt(pCaster, castSpellId, me->GetObjectGuid());
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Interrupt] %s: %s -> %s (%s, %.1f s left)%s", me->GetName(),
-                pInterrupt->SpellName[0].c_str(), pCaster->GetName(), castName.c_str(), timeLeft / 1000.0f,
+                pInterrupt->SpellName[0].c_str(), GetLogName(pCaster).c_str(), castName.c_str(), timeLeft / 1000.0f,
                 pCaster == me->GetVictim() ? "" : " [not own target]");
             return true;
         }
@@ -3552,7 +3647,7 @@ void PartyBotAI::UpdateInCombatAI()
             if (UpdateTankDuty())
                 return;
         }
-        else if (CrowdControlMarkedTargets())
+        else if (!HealsBeforeCC() && CrowdControlMarkedTargets())
             return;
     }
 
@@ -4093,7 +4188,7 @@ void PartyBotAI::MaintainHunterPet()
     {
         pPet->SetReactState(REACT_PASSIVE);
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pet] %s: pet %s (level %u) set passive",
-            me->GetName(), pPet->GetName(), pPet->GetLevel());
+            me->GetName(), GetLogName(pPet).c_str(), pPet->GetLevel());
     }
 
     if (pPet->GetLevel() != me->GetLevel())
@@ -4101,7 +4196,7 @@ void PartyBotAI::MaintainHunterPet()
         uint32 const oldLevel = pPet->GetLevel();
         pPet->GivePetLevel(me->GetLevel());
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pet] %s: pet %s level %u -> %u (hunter %u)",
-            me->GetName(), pPet->GetName(), oldLevel, pPet->GetLevel(), me->GetLevel());
+            me->GetName(), GetLogName(pPet).c_str(), oldLevel, pPet->GetLevel(), me->GetLevel());
     }
 
     if (pPet->GetPower(POWER_HAPPINESS) < pPet->GetMaxPower(POWER_HAPPINESS))
@@ -5027,7 +5122,7 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
             {
                 if (m_role == ROLE_TANK)
                     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Revenge on %s (rage %u)",
-                        me->GetName(), pVictim->GetName(), me->GetPower(POWER_RAGE) / 10);
+                        me->GetName(), GetLogName(pVictim).c_str(), me->GetPower(POWER_RAGE) / 10);
                 return;
             }
         }
@@ -5056,11 +5151,11 @@ void PartyBotAI::UpdateInCombatAI_Warrior()
             {
                 if (stacks < maxStacks)
                     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor (%u) on %s, stack %u/%u (rage %u)",
-                        me->GetName(), m_spells.warrior.pSunderArmor->Id, pVictim->GetName(), stacks + 1, maxStacks,
+                        me->GetName(), m_spells.warrior.pSunderArmor->Id, GetLogName(pVictim).c_str(), stacks + 1, maxStacks,
                         me->GetPower(POWER_RAGE) / 10);
                 else
                     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Tank] %s: Sunder Armor (%u) on %s, refresh %u/%u (%.1f s left, rage %u)",
-                        me->GetName(), m_spells.warrior.pSunderArmor->Id, pVictim->GetName(), stacks, maxStacks, remaining / 1000.0f,
+                        me->GetName(), m_spells.warrior.pSunderArmor->Id, GetLogName(pVictim).c_str(), stacks, maxStacks, remaining / 1000.0f,
                         me->GetPower(POWER_RAGE) / 10);
                 return;
             }

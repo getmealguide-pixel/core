@@ -1205,7 +1205,7 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
             {
                 PSendSysMessage("%s keeps its talents (saved or cloned character).", pTarget->GetName());
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: role %s, talents kept (saved or cloned character)",
-                    pTarget->GetName(), CombatBotBaseAI::GetRoleName(role));
+                    CombatBotBaseAI::GetLogName(pTarget).c_str(), CombatBotBaseAI::GetRoleName(role));
             }
             else if (roleChanged || pAI->m_pendingRespec)
             {
@@ -1214,7 +1214,7 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
                 {
                     PSendSysMessage("%s gets new talents when the fight ends.", pTarget->GetName());
                     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: respec for role %s waits for the fight to end",
-                        pTarget->GetName(), CombatBotBaseAI::GetRoleName(role));
+                        CombatBotBaseAI::GetLogName(pTarget).c_str(), CombatBotBaseAI::GetRoleName(role));
                 }
                 else
                     PSendSysMessage("%s gets new talents now.", pTarget->GetName());
@@ -1495,7 +1495,7 @@ bool ChatHandler::HandlePartyBotAttackStartCommand(char* args)
         }
     }
 
-    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: attack %s -> %s", pPlayer->GetName(), pTarget->GetName(),
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Attack] %s: attack %s -> %s", pPlayer->GetName(), CombatBotBaseAI::GetLogName(pTarget).c_str(),
         attackers.empty() ? "nobody" : attackers.c_str());
     PSendSysMessage("All party bots are now attacking %s.", pTarget->GetName());
     return true;
@@ -1582,7 +1582,7 @@ bool ChatHandler::HandlePartyBotAoECommand(char* args)
     if (pTarget && pTarget != pPlayer && dynamic_cast<PartyBotAI*>(pTarget->AI()))
     {
         GetCommandedPartyBotAI(pTarget)->SetAoEMode(mode, "command");
-        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: aoe %s -> %s", pPlayer->GetName(), arg1, pTarget->GetName());
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[AoE] %s: aoe %s -> %s", pPlayer->GetName(), arg1, CombatBotBaseAI::GetLogName(pTarget).c_str());
         PSendSysMessage("%s: aoe %s.", pTarget->GetName(), arg1);
         return true;
     }
@@ -1733,7 +1733,7 @@ bool ChatHandler::HandlePartyBotControlMarkCommand(char* args)
                 pAI->m_ccMarksAuto = false;
                 pAI->m_marksToCC.push_back(itrMark->second);
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: ccmark %s -> %s (no bot attacks it unless ordered)",
-                    pPlayer->GetName(), args, pTarget->GetName());
+                    pPlayer->GetName(), args, CombatBotBaseAI::GetLogName(pTarget).c_str());
                 PartyBotAI::AssignCCMarks(pPlayer, false, "ccmark");
                 return true;
             }
@@ -1806,7 +1806,7 @@ bool ChatHandler::HandlePartyBotFocusMarkCommand(char* args)
                 PSendSysMessage("%s will focus %s.", pTarget->GetName(), args);
                 pAI->m_marksToFocus.push_back(itrMark->second);
                 sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: focusmark %s -> %s", pPlayer->GetName(), args,
-                    pTarget->GetName());
+                    CombatBotBaseAI::GetLogName(pTarget).c_str());
                 return true;
             }
         }
@@ -1862,7 +1862,7 @@ bool ChatHandler::HandlePartyBotClearMarksCommand(char* args)
             if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
             {
                 PSendSysMessage("All mark assignments cleared for %s.", pTarget->GetName());
-                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: clearmarks -> %s", pPlayer->GetName(), pTarget->GetName());
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Mark] %s: clearmarks -> %s", pPlayer->GetName(), CombatBotBaseAI::GetLogName(pTarget).c_str());
                 pAI->m_marksToCC.clear();
                 pAI->m_ccMarksAuto = false;
                 pAI->m_releasedCC.clear();
@@ -2396,7 +2396,7 @@ bool ChatHandler::HandlePartyBotPullHelper(char* args, bool ranged)
         seconds = 10;
     uint32 const duration = seconds * IN_MILLISECONDS;
 
-    std::string tanks, paused;
+    std::string tanks, paused, healerCC;
     for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
     {
         if (Player* pMember = itr->getSource())
@@ -2422,14 +2422,21 @@ bool ChatHandler::HandlePartyBotPullHelper(char* args, bool ranged)
                             tanks += tanks.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
                         }
                     }
+                    else if (pAI->m_role == ROLE_HEALER && pAI->HasPendingCCMark())
+                    {
+                        // Healers never wait: they crowd-control their marks at once (19d).
+                        pAI->StartHealerPullCC(duration);
+                        healerCC += healerCC.empty() ? pMember->GetName() : std::string(", ") + pMember->GetName();
+                    }
                 }
             }
         }
     }
 
-    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: %s %s, tank %s, DPS paused %u s: %s", pPlayer->GetName(),
-        ranged ? "ranged pull" : "pull", pTarget->GetName(), tanks.empty() ? "none" : tanks.c_str(), seconds,
-        paused.empty() ? "none" : paused.c_str());
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: %s %s, tank %s, DPS paused %u s: %s, healer CC: %s",
+        pPlayer->GetName(), ranged ? "ranged pull" : "pull", CombatBotBaseAI::GetLogName(pTarget).c_str(),
+        tanks.empty() ? "none" : tanks.c_str(), seconds, paused.empty() ? "none" : paused.c_str(),
+        healerCC.empty() ? "none" : healerCC.c_str());
     PSendSysMessage("Tank party bots are %s %s, DPS party bots are paused for %u seconds.",
         ranged ? "shooting to pull" : "pulling", pTarget->GetName(), seconds);
     return true;

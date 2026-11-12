@@ -2442,7 +2442,7 @@ void CombatBotBaseAI::SummonPetIfNeeded()
             pCreature->SetLevel(me->GetLevel());
             me->CastSpell(pCreature, SPELL_TAME_BEAST, true);
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pet] %s: tames %s (level %u), pet %s",
-                me->GetName(), pCreature->GetName(), pCreature->GetLevel(), me->GetPet() ? "created" : "NOT created");
+                me->GetName(), GetLogName(pCreature).c_str(), pCreature->GetLevel(), me->GetPet() ? "created" : "NOT created");
         }
     }
     else if (me->GetClass() == CLASS_WARLOCK)
@@ -3276,6 +3276,13 @@ bool CombatBotBaseAI::CanTryToCastSpell(Unit const* pTarget, SpellEntry const* p
     return true;
 }
 
+std::string CombatBotBaseAI::GetLogName(Unit const* pUnit)
+{
+    if (!pUnit->IsCreature())
+        return pUnit->GetName();
+    return std::string(pUnit->GetName()) + "#" + std::to_string(pUnit->GetGUIDLow());
+}
+
 SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pSpellEntry)
 {
     if (m_preventCasting)
@@ -3293,7 +3300,7 @@ SpellCastResult CombatBotBaseAI::DoCastSpell(Unit* pTarget, SpellEntry const* pS
 
     if (result == SPELL_CAST_OK)
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Cast] %s: %s (%u) on %s", me->GetName(),
-            pSpellEntry->SpellName[0].c_str(), pSpellEntry->Id, pTarget->GetName());
+            pSpellEntry->SpellName[0].c_str(), pSpellEntry->Id, GetLogName(pTarget).c_str());
 
     if ((result == SPELL_FAILED_MOVING ||
         result == SPELL_CAST_OK) &&
