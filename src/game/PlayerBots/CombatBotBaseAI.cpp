@@ -2524,7 +2524,7 @@ void CombatBotBaseAI::LearnPremadeSpecForClass()
     }
 }
 
-void CombatBotBaseAI::LearnRandomTalents(uint32 forcedTab)
+void CombatBotBaseAI::LearnRandomTalents()
 {
     if (!me->GetFreeTalentPoints())
         return;
@@ -2545,9 +2545,7 @@ void CombatBotBaseAI::LearnRandomTalents(uint32 forcedTab)
     if (talentTabsForClass.empty())
         return;
 
-    uint32 chosenTab = forcedTab;
-    if (std::find(talentTabsForClass.begin(), talentTabsForClass.end(), chosenTab) == talentTabsForClass.end())
-        chosenTab = SelectRandomContainerElement(talentTabsForClass);
+    uint32 chosenTab = SelectRandomContainerElement(talentTabsForClass);
 
     std::map<uint32 /*row*/, std::vector<std::pair<uint32 /*talent id*/, uint32 /*ranks*/>>> possibleTalents;
     for (uint32 talentId = 0; talentId < sTalentStore.GetNumRows(); ++talentId)

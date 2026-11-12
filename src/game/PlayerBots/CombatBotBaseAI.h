@@ -103,7 +103,7 @@ public:
     // Score of an item for the bot's class and role; negative = unsuitable.
     float GetRoleGearScore(ItemPrototype const* pProto) const;
     void AutoEquipGear(uint32 option);
-    void LearnRandomTalents(uint32 forcedTab = UINT32_MAX); // forcedTab: talent tree to use, else random
+    void LearnRandomTalents();
     
     uint8 GetAttackersInRangeCount(float range) const;
     Unit* SelectAttackerDifferentFrom(Unit const* pExcept) const;

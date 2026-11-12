@@ -874,6 +874,15 @@ static PartyBotAI* GetCommandedPartyBotAI(Player* pBot)
     return pAI;
 }
 
+// The role "dps" means for a class (add, setrole, slot none). Shamans and druids are casters
+// (Elemental, Balance): enhancement and cat specs are not supported.
+static CombatBotRoles GetDpsRoleForClass(uint8 playerClass)
+{
+    if (playerClass == CLASS_SHAMAN || playerClass == CLASS_DRUID)
+        return ROLE_RANGE_DPS;
+    return CombatBotBaseAI::IsMeleeDamageClass(playerClass) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
+}
+
 bool ChatHandler::HandlePartyBotAddCommand(char* args)
 {
     Player* pPlayer = m_session->GetPlayer();
@@ -1027,7 +1036,7 @@ bool ChatHandler::HandlePartyBotAddCommand(char* args)
     }
 
     if (roleGiven && botRole == ROLE_INVALID) // "dps"
-        botRole = CombatBotBaseAI::IsMeleeDamageClass(botClass) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
+        botRole = GetDpsRoleForClass(botClass);
     else if (!roleGiven) // decided now, so it is known and shown at once
         botRole = CombatBotBaseAI::GetDefaultRoleForClass(botClass);
 
@@ -1160,7 +1169,7 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
     if (roleStr == "tank")
         role = ROLE_TANK;
     else if (roleStr == "dps")
-        role = CombatBotBaseAI::IsMeleeDamageClass(pTarget->GetClass()) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
+        role = GetDpsRoleForClass(pTarget->GetClass());
     else if (roleStr == "meleedps")
         role = ROLE_MELEE_DPS;
     else if (roleStr == "rangedps")
@@ -1182,12 +1191,34 @@ bool ChatHandler::HandlePartyBotSetRoleCommand(char* args)
     {
         if (PartyBotAI* pAI = GetCommandedPartyBotAI(pTarget))
         {
+            bool const roleChanged = pAI->m_role != role;
             pAI->m_role = role;
             if (role != ROLE_TANK)
                 pAI->m_tankSlotManual = false;
             pAI->ResetSpellData();
             pAI->PopulateSpellData();
             PSendSysMessage("%s is now a %s.", pTarget->GetName(), roleStr.c_str());
+
+            // Task 17: added bots get the new role's talents once out of combat; saved (loaded)
+            // and cloned characters keep theirs.
+            if (!pAI->IsLevelSynced())
+            {
+                PSendSysMessage("%s keeps its talents (saved or cloned character).", pTarget->GetName());
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: role %s, talents kept (saved or cloned character)",
+                    pTarget->GetName(), CombatBotBaseAI::GetRoleName(role));
+            }
+            else if (roleChanged || pAI->m_pendingRespec)
+            {
+                pAI->m_pendingRespec = true;
+                if (pTarget->IsInCombat())
+                {
+                    PSendSysMessage("%s gets new talents when the fight ends.", pTarget->GetName());
+                    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: respec for role %s waits for the fight to end",
+                        pTarget->GetName(), CombatBotBaseAI::GetRoleName(role));
+                }
+                else
+                    PSendSysMessage("%s gets new talents now.", pTarget->GetName());
+            }
             return true;
         }
     }
@@ -1268,7 +1299,7 @@ bool ChatHandler::HandlePartyBotSlotCommand(char* args)
         if (manual && slot != PB_TANK_SLOT_NONE)
             newRole = ROLE_TANK;
         else if (manual)
-            newRole = CombatBotBaseAI::IsMeleeDamageClass(pTarget->GetClass()) ? ROLE_MELEE_DPS : ROLE_RANGE_DPS;
+            newRole = GetDpsRoleForClass(pTarget->GetClass());
 
         pAI->m_tankSlotManual = manual && slot != PB_TANK_SLOT_NONE;
         pAI->m_tankSlotChoice = slot;

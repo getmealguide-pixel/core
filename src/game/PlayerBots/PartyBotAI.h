@@ -60,6 +60,8 @@ enum PartyBotTankSlot : uint8
 
 typedef std::map<ObjectGuid, uint8> PartyBotTankSlotMap;
 
+struct PlayerPremadeSpecTemplate;
+
 class PartyBotAI : public CombatBotBaseAI
 {
 public:
@@ -193,8 +195,13 @@ public:
     bool IsLevelSynced() const { return m_race && m_class && m_cloneGuid.IsEmpty(); }
     void SyncLevelWithLeader(Player const* pLeader);
     void LearnSpellsAndTalentsForLevel(bool resetTalents);
-    bool LearnRoleSpecTalents();
-    uint32 GetMainTalentTab() const;
+    // Task 17 talents: the role's level 60 premade spec (nullptr if none), spent main tree
+    // first, deepest talent first. Log "[Talent]".
+    PlayerPremadeSpecTemplate const* GetRoleSpec() const;
+    void LearnRoleSpecTalents(PlayerPremadeSpecTemplate const& spec);
+    // setrole on an added bot: new talents for the new role, once out of combat.
+    void RespecForRole();
+    bool m_pendingRespec = false;
 
     // Area spells. Damage area spells only (no fears, roots, shouts or taunts); the first one in
     // range that the casting rules allow is cast at the target (ground spells land on its spot).

@@ -1130,6 +1130,10 @@ void PartyBotAI::UpdateAI(uint32 const diff)
         return;
     }
 
+    // setrole respec (added bots), once out of combat.
+    if (m_pendingRespec && !me->IsInCombat())
+        RespecForRole();
+
     if (m_resetSpellData)
     {
         ResetSpellData();
@@ -2342,47 +2346,8 @@ void PartyBotAI::UpdateOutOfCombatAI()
     }
 }
 
-// The talent tree with the most talent ranks learned (UINT32_MAX if none).
-uint32 PartyBotAI::GetMainTalentTab() const
-{
-    std::map<uint32, uint32> ranksPerTab;
-    for (uint32 talentId = 0; talentId < sTalentStore.GetNumRows(); ++talentId)
-    {
-        TalentEntry const* talentInfo = sTalentStore.LookupEntry(talentId);
-        if (!talentInfo)
-            continue;
-
-        TalentTabEntry const* tabInfo = sTalentTabStore.LookupEntry(talentInfo->TalentTab);
-        if (!tabInfo || !(me->GetClassMask() & tabInfo->ClassMask))
-            continue;
-
-        for (int32 rank = MAX_TALENT_RANK - 1; rank >= 0; --rank)
-        {
-            if (talentInfo->RankID[rank] && me->HasSpell(talentInfo->RankID[rank]))
-            {
-                ranksPerTab[talentInfo->TalentTab] += rank + 1;
-                break;
-            }
-        }
-    }
-
-    uint32 bestTab = UINT32_MAX;
-    uint32 bestRanks = 0;
-    for (auto const& itr : ranksPerTab)
-    {
-        if (itr.second > bestRanks)
-        {
-            bestTab = itr.first;
-            bestRanks = itr.second;
-        }
-    }
-    return bestTab;
-}
-
-// Spends free talent points on the highest-level premade spec of the bot's class and role
-// (the level 60 PvE specs), in template order, rank by rank. Talents whose tier is not
-// reached yet are picked up on later dings. False if no spec matches the role.
-bool PartyBotAI::LearnRoleSpecTalents()
+// The highest-level premade spec of the bot's class and role (the level 60 PvE specs).
+PlayerPremadeSpecTemplate const* PartyBotAI::GetRoleSpec() const
 {
     PlayerPremadeSpecTemplate const* pSpec = nullptr;
     for (auto const& itr : sObjectMgr.GetPlayerPremadeSpecTemplates())
@@ -2391,52 +2356,165 @@ bool PartyBotAI::LearnRoleSpecTalents()
            (!pSpec || itr.second.level > pSpec->level))
             pSpec = &itr.second;
     }
-
-    if (!pSpec)
-        return false;
-
-    std::vector<TalentSpellPos const*> talents;
-    for (uint32 spellId : pSpec->spells)
-        if (TalentSpellPos const* pPos = GetTalentSpellPos(spellId))
-            talents.push_back(pPos);
-
-    bool progress = true;
-    while (progress && me->GetFreeTalentPoints())
-    {
-        progress = false;
-        for (TalentSpellPos const* pPos : talents)
-            for (uint32 rank = 0; rank <= pPos->rank && me->GetFreeTalentPoints(); ++rank)
-                if (me->LearnTalent(pPos->talent_id, rank))
-                    progress = true;
-    }
-    return true;
+    return pSpec;
 }
 
-// Trainer spells up to the current level, then talents: the role's spec, or (no spec for the
-// role) random talents kept in the tree the bot already uses. resetTalents replaces the talents
-// a new bot got from the class's generic premade spec.
+// Ranks of a talent the bot has learned (0 = none).
+static uint32 GetLearnedTalentRanks(Player const* pPlayer, TalentEntry const* pTalent)
+{
+    for (int32 rank = MAX_TALENT_RANK - 1; rank >= 0; --rank)
+        if (pTalent->RankID[rank] && pPlayer->HasSpell(pTalent->RankID[rank]))
+            return rank + 1;
+    return 0;
+}
+
+// Spends free talent points on the spec. A spec spell that is a higher trainer rank of a
+// talent (e.g. Bloodthirst rank 4) counts as rank 1 of that talent. Each point goes to the
+// spec's main tree (most ranks) first, deepest talent the talent rules allow first, then to
+// the other trees, so key talents arrive as soon as their tier opens.
+void PartyBotAI::LearnRoleSpecTalents(PlayerPremadeSpecTemplate const& spec)
+{
+    struct SpecTalent
+    {
+        TalentEntry const* talent;
+        uint32 ranks; // ranks the spec wants
+    };
+    std::vector<SpecTalent> talents;
+    std::map<uint32, uint32> ranksPerTab;
+
+    for (uint32 spellId : spec.spells)
+    {
+        TalentSpellPos const* pPos = GetTalentSpellPos(spellId);
+        if (!pPos)
+        {
+            uint32 const firstRankId = sSpellMgr.GetFirstSpellInChain(spellId);
+            if (firstRankId && firstRankId != spellId)
+                pPos = GetTalentSpellPos(firstRankId);
+        }
+        if (!pPos)
+            continue; // not a talent (trainer spell)
+
+        TalentEntry const* pTalent = sTalentStore.LookupEntry(pPos->talent_id);
+        if (!pTalent)
+            continue;
+
+        // A trainer rank maps to rank 1 of its talent; keep the highest rank per talent.
+        uint32 const ranks = (GetTalentSpellPos(spellId) ? pPos->rank : 0) + 1;
+        auto itr = std::find_if(talents.begin(), talents.end(),
+            [pTalent](SpecTalent const& st) { return st.talent == pTalent; });
+        if (itr == talents.end())
+        {
+            talents.push_back({ pTalent, ranks });
+            ranksPerTab[pTalent->TalentTab] += ranks;
+        }
+        else if (ranks > itr->ranks)
+        {
+            ranksPerTab[pTalent->TalentTab] += ranks - itr->ranks;
+            itr->ranks = ranks;
+        }
+    }
+
+    uint32 mainTab = 0;
+    uint32 mainRanks = 0;
+    for (auto const& itr : ranksPerTab)
+    {
+        if (itr.second > mainRanks)
+        {
+            mainTab = itr.first;
+            mainRanks = itr.second;
+        }
+    }
+
+    // Main tree first, then deepest tier first; spec order otherwise.
+    std::stable_sort(talents.begin(), talents.end(), [mainTab](SpecTalent const& a, SpecTalent const& b)
+    {
+        bool const aMain = a.talent->TalentTab == mainTab;
+        bool const bMain = b.talent->TalentTab == mainTab;
+        if (aMain != bMain)
+            return aMain;
+        return a.talent->Row > b.talent->Row;
+    });
+
+    std::vector<std::pair<TalentEntry const*, uint32>> learned; // talent, ranks after this call (learn order)
+    while (me->GetFreeTalentPoints())
+    {
+        bool learnedOne = false;
+        for (SpecTalent const& st : talents)
+        {
+            uint32 const current = GetLearnedTalentRanks(me, st.talent);
+            if (current >= st.ranks)
+                continue;
+
+            if (me->LearnTalent(st.talent->TalentID, current))
+            {
+                auto itr = std::find_if(learned.begin(), learned.end(),
+                    [&st](std::pair<TalentEntry const*, uint32> const& l) { return l.first == st.talent; });
+                if (itr == learned.end())
+                    learned.emplace_back(st.talent, current + 1);
+                else
+                    itr->second = current + 1;
+                learnedOne = true;
+                break;
+            }
+        }
+        if (!learnedOne)
+            break;
+    }
+
+    if (learned.empty())
+        return;
+
+    std::string list;
+    for (auto const& itr : learned)
+    {
+        uint32 maxRanks = 0;
+        while (maxRanks < MAX_TALENT_RANK && itr.first->RankID[maxRanks])
+            ++maxRanks;
+        SpellEntry const* pSpellEntry = sSpellMgr.GetSpellEntry(itr.first->RankID[0]);
+        if (!list.empty())
+            list += ", ";
+        list += (pSpellEntry ? pSpellEntry->SpellName[0] : std::to_string(itr.first->TalentID)) +
+            " " + std::to_string(itr.second) + "/" + std::to_string(maxRanks);
+    }
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: level %u, spec %s: %s",
+        me->GetName(), me->GetLevel(), spec.name.c_str(), list.c_str());
+}
+
+// Talents of the role's spec, then trainer spells up to the current level (after the talents:
+// higher ranks of talent spells such as Bloodthirst need rank 1). resetTalents starts the
+// talents over (new bot, respec). Points the spec cannot use stay unspent and are logged.
 void PartyBotAI::LearnSpellsAndTalentsForLevel(bool resetTalents)
 {
+    if (resetTalents)
+        me->ResetTalents(true);
+
+    PlayerPremadeSpecTemplate const* pSpec = GetRoleSpec();
+    if (pSpec)
+        LearnRoleSpecTalents(*pSpec);
+
     char args[] = "";
     ChatHandler(me).HandleLearnAllTrainerCommand(args);
 
-    uint32 const mainTab = GetMainTalentTab();
-    bool hasRoleSpec = false;
-    for (auto const& itr : sObjectMgr.GetPlayerPremadeSpecTemplates())
-        if (itr.second.requiredClass == me->GetClass() && itr.second.role == m_role)
-            hasRoleSpec = true;
-
-    if (hasRoleSpec)
+    if (uint32 const unspent = me->GetFreeTalentPoints())
     {
-        if (resetTalents)
-            me->ResetTalents(true);
-        LearnRoleSpecTalents();
+        if (pSpec)
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: level %u, %u points unspent (spec %s)",
+                me->GetName(), me->GetLevel(), unspent, pSpec->name.c_str());
+        else
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: level %u, %u points unspent (no spec for role %s)",
+                me->GetName(), me->GetLevel(), unspent, GetRoleName(m_role));
     }
+}
 
-    // No spec for the role, or the spec has fewer points than the bot (e.g. a lower-level
-    // template): put the rest into the tree the bot mostly uses.
-    if (me->GetFreeTalentPoints())
-        LearnRandomTalents(hasRoleSpec ? GetMainTalentTab() : mainTab);
+// setrole on an added bot: talents start over for the new role (the caller waits until the
+// bot is out of combat). Spell data is rebuilt on the next update.
+void PartyBotAI::RespecForRole()
+{
+    m_pendingRespec = false;
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: respec for role %s",
+        me->GetName(), GetRoleName(m_role));
+    LearnSpellsAndTalentsForLevel(true);
+    m_resetSpellData = true;
 }
 
 void PartyBotAI::SyncLevelWithLeader(Player const* pLeader)
