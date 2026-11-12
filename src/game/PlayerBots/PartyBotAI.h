@@ -195,6 +195,9 @@ public:
     bool IsLevelSynced() const { return m_race && m_class && m_cloneGuid.IsEmpty(); }
     void SyncLevelWithLeader(Player const* pLeader);
     void LearnSpellsAndTalentsForLevel(bool resetTalents);
+    // Class book spells up to the bot's level (Prayer of Fortitude, Gift of the Wild...), raid-drop
+    // books skipped. Log "[Book]".
+    void LearnClassBookSpells();
     // Task 17 talents: the role's level 60 premade spec (nullptr if none), spent main tree
     // first, deepest talent first. Log "[Talent]".
     PlayerPremadeSpecTemplate const* GetRoleSpec() const;

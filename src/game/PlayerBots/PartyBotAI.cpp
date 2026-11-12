@@ -2498,6 +2498,7 @@ void PartyBotAI::LearnSpellsAndTalentsForLevel(bool resetTalents)
     char args[] = "";
     ChatHandler(me).HandleLearnAllQuestsCommand(args);
     ChatHandler(me).HandleLearnAllTrainerCommand(args);
+    LearnClassBookSpells();
 
     if (uint32 const unspent = me->GetFreeTalentPoints())
     {
@@ -2508,6 +2509,70 @@ void PartyBotAI::LearnSpellsAndTalentsForLevel(bool resetTalents)
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Talent] %s: level %u, %u points unspent (no spec for role %s)",
                 me->GetName(), me->GetLevel(), unspent, GetRoleName(m_role));
     }
+}
+
+// Class books that only drop in raids (checked in the loot tables): bots start pre-raid.
+static uint32 const RaidOnlyClassBooks[] =
+{
+    // Ruins of Ahn'Qiraj (Kurinnaxx, Rajaxx, Moam, Buru, Ayamiss, Ossirian)
+    21214, 21279, 21280,    // mage: Frostbolt XI, Fireball XII, Arcane Missiles VIII
+    21281, 21282, 21283,    // warlock: Shadow Bolt X, Immolate VIII, Corruption VII
+    21284, 21285, 21287,    // priest: Greater Heal V, Renew X, Prayer of Healing V
+    21288, 21289, 21290,    // paladin: Blessing of Wisdom VI, Blessing of Might VII, Holy Light IX
+    21291, 21292, 21293,    // shaman: Healing Wave X, Strength of Earth Totem V, Grace of Air Totem III
+    21294, 21295, 21296,    // druid: Healing Touch XI, Starfire VII, Rejuvenation XI
+    21297, 21298, 21299,    // warrior: Heroic Strike IX, Battle Shout VII, Revenge VI
+    21300, 21302, 21303,    // rogue: Backstab IX, Deadly Poison V, Feint V
+    21304, 21306, 21307,    // hunter: Multi-Shot V, Serpent Sting IX, Aspect of the Hawk VII
+    16665,                  // Tome of Tranquilizing Shot (Lucifron, Molten Core)
+    22739,                  // Tome of Polymorph: Turtle (Gahz'ranka, Zul'Gurub)
+};
+
+// Class books (one class, no profession, obtainable, usable at the bot's level) teach spells that no
+// trainer or quest gives, e.g. Prayer of Fortitude, Gift of the Wild, Arcane Brilliance. Grimoires
+// teach the demon (target pet) and are left out.
+void PartyBotAI::LearnClassBookSpells()
+{
+    std::string learned;
+    std::string skipped;
+    for (auto const& itr : sObjectMgr.GetItemPrototypeMap())
+    {
+        ItemPrototype const& proto = itr.second;
+        if (proto.Class != ITEM_CLASS_RECIPE || proto.SubClass != ITEM_SUBCLASS_BOOK ||
+            proto.HasExtraFlag(ITEM_EXTRA_NOT_OBTAINABLE) || proto.RequiredSkill ||
+            (proto.AllowableClass & CLASSMASK_ALL_PLAYABLE) != me->GetClassMask() ||
+            proto.RequiredLevel > me->GetLevel() ||
+            proto.Spells[0].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+            continue;
+
+        SpellEntry const* pTeach = sSpellMgr.GetSpellEntry(proto.Spells[0].SpellId);
+        if (!pTeach)
+            continue;
+
+        for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            uint32 const spellId = pTeach->EffectTriggerSpell[i];
+            if (pTeach->Effect[i] != SPELL_EFFECT_LEARN_SPELL || pTeach->EffectImplicitTargetA[i] != TARGET_UNIT_CASTER ||
+                !spellId || me->HasSpell(spellId))
+                continue;
+
+            SpellEntry const* pSpell = sSpellMgr.GetSpellEntry(spellId);
+            std::string const name = pSpell ? pSpell->SpellName[0] + (pSpell->Rank[0].empty() ? "" : " (" + pSpell->Rank[0] + ")") : std::to_string(spellId);
+            if (std::find(std::begin(RaidOnlyClassBooks), std::end(RaidOnlyClassBooks), proto.ItemId) != std::end(RaidOnlyClassBooks))
+            {
+                skipped += (skipped.empty() ? "" : ", ") + name;
+                continue;
+            }
+
+            me->LearnSpell(spellId, false);
+            learned += (learned.empty() ? "" : ", ") + name;
+        }
+    }
+
+    if (!learned.empty())
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Book] %s: level %u, learned %s", me->GetName(), me->GetLevel(), learned.c_str());
+    if (!skipped.empty())
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Book] %s: level %u, raid-drop books skipped: %s", me->GetName(), me->GetLevel(), skipped.c_str());
 }
 
 // setrole on an added bot: talents start over for the new role (the caller waits until the
