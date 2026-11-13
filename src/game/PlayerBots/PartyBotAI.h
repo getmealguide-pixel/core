@@ -60,6 +60,15 @@ enum PartyBotTankSlot : uint8
 
 typedef std::map<ObjectGuid, uint8> PartyBotTankSlotMap;
 
+// F6: enemy ground fire near a bot: burning already (dynamic object) or about to land (cast).
+struct PartyBotGroundDanger
+{
+    float x, y, z, radius;
+    uint32 timeLeft;         // ms: until it lands (landing) or burns out
+    std::string spellName;
+    bool landing;
+};
+
 // F3 kite steps: take the boss, run the path out, wait at its end, Feign Death, run back.
 enum PartyBotKitePhase : uint8
 {
@@ -69,6 +78,7 @@ enum PartyBotKitePhase : uint8
     PB_KITE_END,
     PB_KITE_FEIGN,
     PB_KITE_BACK,
+    PB_KITE_RETURN,          // back at the path start: walk to the spot the kiter stood on at the pull
 };
 
 struct PlayerPremadeSpecTemplate;
@@ -164,6 +174,16 @@ public:
     void UpdateCCCastOutcome(bool replaced = false);
     void UpdateDiagnostics();
     void LogUnhealableAllies();                  // healer: hurt allies out of reach or sight
+    void CollectGroundDangers(std::vector<PartyBotGroundDanger>& dangers) const;
+    PartyBotGroundDanger const* GetGroundDangerAt(std::vector<PartyBotGroundDanger> const& dangers,
+        float x, float y, float z, float margin) const;
+    bool IsGoodFireEscapeSpot(float x, float y, float z) const;
+    bool UpdateGroundFire();                     // F6: step out of enemy ground fire; true while walking out
+    void StartKiteReturn();                      // F3: path run back: to the own spot or the pull spot
+    bool IsKitedByOtherKiter(Unit const* pEnemy) const;
+    bool MayChase(Unit* pVictim) const override; // F6: ranged / healers: no chase while ground fire is near
+    bool HoldSpotInGroundFire();                 // F6: hold spot burning: wait beside it
+    void LogGroundFireAura();                    // F6, every tick: standing in enemy ground fire
     void OnCastStarted(Unit* pTarget, SpellEntry const* pSpellEntry) final;
     void OrderHoldSpot(uint32 mapId, float x, float y, float z);
     void OrderFollow();
@@ -221,6 +241,7 @@ public:
     static uint32 GetKitePathSize(uint32 mapId);
     void SetKiter(bool on);
     bool IsKiter() const { return m_kiter; }
+    bool IsKiteIdle() const { return m_kitePhase == PB_KITE_NONE; }
     Player* GetKiterOf(Unit const* pEnemy) const;   // group bot kiting this enemy, if any
     bool IsKiteCandidate(Unit const* pBoss) const;
     char const* StartKitePull(Unit* pBoss);         // nullptr = started, else why not
@@ -354,6 +375,12 @@ public:
     ObjectGuid m_diagLastAttackerGuid;           // B12: enemy last hitting this bot
     std::map<ObjectGuid, ObjectGuid> m_diagBossVictims; // B12: boss -> victim last logged
     std::map<ObjectGuid, uint8> m_healSkipLogged; // hurt ally -> 1 out of reach, 2 out of sight (logged)
+    bool m_fireDodging = false;                  // F6: walking out of ground fire
+    uint32 m_fireDodgeTime = 0;                  // F6: when the step out began (ms)
+    uint32 m_fireNoSpotTime = 0;                 // F6: last "no safe spot" log (ms)
+    bool m_fireHoldWaitLogged = false;           // F6: "waits, fire on its spot" logged
+    bool m_inFireLogged = false;                 // F6: "burns in ..." logged
+    uint32 m_inFireTime = 0;                     // F6: when the bot entered fire (ms)
     bool m_supplyBagFullLogged = false;          // "bags full" logged this fight
     uint32 m_bandageSpellId = 0;                 // spell of the bandage being channeled, 0 = none
     ObjectGuid m_bandageTargetGuid;              // enemy attacked before bandaging (re-attacked after)
@@ -393,6 +420,13 @@ public:
     int32 m_kiteIndex = -1;                      // F3: path point the kiter runs to
     bool m_kiteWaitLogged = false;               // F3: "waits, boss ahead" logged once per wait
     bool m_kiteDistracted = false;               // F3: Distracting Shot used since taking the boss
+    bool m_kiteAtStart = true;                   // F3: kiter pull: reached the path start (opens from there)
+    bool m_kiteOpened = false;                   // F3: opener cast on a boss not fighting yet
+    float m_kiteRangeTrim = 0.0f;                // F3: opener out of reach where WalkIntoRange stopped: walk closer
+    uint32 m_kiteReturnMapId = 0;                // F3: where the kiter stood when the kite began
+    float m_kiteReturnX = 0.0f;
+    float m_kiteReturnY = 0.0f;
+    float m_kiteReturnZ = 0.0f;
     bool m_kiteNoPathLogged = false;             // F3: "no kite path" logged once
     bool UpdateKite();
     void UpdateKiteMovement();                   // every tick: path running, getting up

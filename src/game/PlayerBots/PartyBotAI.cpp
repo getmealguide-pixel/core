@@ -29,6 +29,9 @@
 #include "Chat.h"
 #include "Utilities/Random.h"
 #include "PathFinder.h"
+#include "DynamicObject.h"
+#include "CellImpl.h"
+#include "GridNotifiersImpl.h"
 
 #include <cstdio>
 #include <fstream>
@@ -200,16 +203,23 @@ enum PartyBotSpells
 #define PB_BLOODRAGE_MAX_RAGE 200        // B13: tank Bloodrage in a fight below this rage (x10)...
 #define PB_BLOODRAGE_MIN_HEALTH_PCT 50.0f // ...and above this health % (it costs health)
 #define PB_HEAL_SKIP_LOG_PCT 80.0f    // healer log: hurt allies below this health it cannot reach
+#define PB_FIRE_SEARCH_RANGE 45.0f    // F6: enemy ground fire / ground casts looked for within this
+#define PB_FIRE_STEP_OUT 3.0f         // F6: escape spot this far outside the fire edge
+#define PB_FIRE_SPOT_MARGIN 1.5f      // F6: escape spot at least this far from any other fire
+#define PB_FIRE_DODGE_MAX_TIME 4000   // F6: a step out that takes longer is over
+#define PB_FIRE_NO_CHASE_RANGE 6.0f   // F6: ranged / healers do not chase while fire is this close (beyond its edge)
+#define PB_FIRE_RANGED_REACH 30.0f    // F6: ranged damage dealers keep their target within this
 #define PB_KITE_POINT_SPACING 4.0f    // F3: recorded kite path: a point every 4 yd
 #define PB_KITE_POINT_REACHED 2.5f    // F3: kiter is at a path point within this
 #define PB_KITE_CLAIM_RANGE 50.0f     // F3: kiter takes bosses within this of the path start
-#define PB_KITE_OPEN_TIMEOUT 10000    // F3: kiter pull: the boss must be fighting within 10 s
+#define PB_KITE_OPEN_TIMEOUT 20000    // F3: kiter pull: the boss must be fighting within 20 s (walk to the path start)
 #define PB_KITE_RUN_START 20.0f       // F3: without Distracting Shot: run out once the boss on the kiter is this close
-#define PB_KITE_OPEN_MARGIN 3.0f      // F3: open this far inside shot range (35 yd -> about 32 yd)
+#define PB_KITE_OUT_GRACE 4000        // F3: just ran off: the boss may need this long to start fighting
 #define PB_KITE_END_WAIT 3000         // F3: at the path end, Feign Death after this long
 #define PB_KITE_FEIGN_HEALTH_PCT 50.0f // F3: caught by the boss on the way out below this health: Feign Death
 #define PB_KITE_FEIGN_MIN_TIME 2000   // F3: lie still at least this long
 #define PB_KITE_BACK_CLEARANCE 30.0f  // F3: get up once the boss has turned away and is this far
+#define PB_KITE_RETURN_TIMEOUT 15000 // F3: the walk to the pull spot ends after this
 #define PB_KITE_BACK_GAP 30.0f        // F3: running back, stay this far behind a walking boss (aggro range 20)
 
 bool PartyBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
@@ -707,7 +717,7 @@ bool PartyBotAI::WalkIntoRange(Unit* pTarget, float range, char const* tag, char
     }
     if (me->GetStandState() != UNIT_STAND_STATE_STAND)
         me->SetStandState(UNIT_STAND_STATE_STAND);
-    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
     return true;
 }
 
@@ -1156,6 +1166,8 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
         UpdateDiagnostics();
 
+        LogGroundFireAura();
+
         UpdateKiteMovement();
 
         // Entering combat (attacked, or the group pulled): think on the next tick, not after
@@ -1358,6 +1370,11 @@ void PartyBotAI::UpdateAI(uint32 const diff)
 
     // Survival layer (16c): potions, mana gem, bandages; also ends/stops a running bandage.
     if (UpdateSurvival())
+        return;
+
+    // F6: out of enemy ground fire, also on stay / move here, during a pull wait and while casting
+    // (the kiter is left out while it kites).
+    if (UpdateGroundFire())
         return;
 
     // F3: a kiter with a boss runs its path (beats casts in progress, orders and stay).
@@ -1695,6 +1712,17 @@ void PartyBotAI::OrderAttack(Unit* pTarget, bool overrideCC, bool ranged)
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Pull] %s: will not pull %s (CC mark; use attack to override)",
             me->GetName(), GetLogName(pTarget).c_str());
         ClearOrderedTarget();
+        return;
+    }
+
+    // F6: stepping out of fire: finish it; the order target is set, the attack follows.
+    if (m_fireDodging && me->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: finishes stepping out of fire before attacking %s",
+            me->GetName(), GetLogName(pTarget).c_str());
+        if (m_holdPosition)
+            SetHoldPosition(false);
+        me->Attack(pTarget, true);
         return;
     }
 
@@ -2067,6 +2095,316 @@ void PartyBotAI::LogUnhealableAllies()
                     pMember->GetName(), pMember->GetHealthPercent(), me->GetDistance(pMember));
             m_healSkipLogged.erase(guid);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// F6 ground fire (19h). Enemy ground spells (Flamestrike: 2.5 s cast, 5 yd, burns 8 s) are seen
+// two ways: while the enemy casts (the landing spot is fixed at cast start) and once they burn
+// (a dynamic object with a damaging persistent area aura). A bot inside steps just outside, to a
+// reachable spot in sight and clear of other fire, CC'd and idle enemies; healers keep the tanks
+// within heal range, ranged damage dealers their target within 30 yd. Bots on stay / move here wait
+// beside their spot until the fire is gone. The kiter is left out while it kites.
+// ---------------------------------------------------------------------------------------------
+static bool IsDamagingGroundAura(uint32 auraType)
+{
+    return auraType == SPELL_AURA_PERIODIC_DAMAGE || auraType == SPELL_AURA_PERIODIC_DAMAGE_PERCENT ||
+           auraType == SPELL_AURA_PERIODIC_LEECH;
+}
+
+// Radius of the ground damage of a spell (0 = not a damaging ground spell).
+static float GetGroundDamageRadius(SpellEntry const* pSpell)
+{
+    float radius = 0.0f;
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        bool const damaging = (pSpell->Effect[i] == SPELL_EFFECT_PERSISTENT_AREA_AURA &&
+                               IsDamagingGroundAura(pSpell->EffectApplyAuraName[i])) ||
+                              (pSpell->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE && pSpell->EffectRadiusIndex[i]);
+        if (damaging)
+            radius = std::max(radius, Spells::GetSpellRadius(sSpellRadiusStore.LookupEntry(pSpell->EffectRadiusIndex[i])));
+    }
+    return radius;
+}
+
+struct PartyBotHostileGroundCheck
+{
+    Unit const* m_bot;
+    float m_range;
+    PartyBotHostileGroundCheck(Unit const* pBot, float range) : m_bot(pBot), m_range(range) {}
+    bool operator()(WorldObject* pObject) const
+    {
+        if (pObject->GetTypeId() != TYPEID_DYNAMICOBJECT || !m_bot->IsWithinDist(pObject, m_range))
+            return false;
+        DynamicObject const* pDyn = static_cast<DynamicObject const*>(pObject);
+        Unit const* pCaster = pDyn->GetUnitCaster();
+        if (!pCaster || !pCaster->IsHostileTo(m_bot))
+            return false;
+        SpellEntry const* pSpell = sSpellMgr.GetSpellEntry(pDyn->GetSpellId());
+        return pSpell && pSpell->Effect[pDyn->GetEffIndex()] == SPELL_EFFECT_PERSISTENT_AREA_AURA &&
+               IsDamagingGroundAura(pSpell->EffectApplyAuraName[pDyn->GetEffIndex()]);
+    }
+};
+
+void PartyBotAI::CollectGroundDangers(std::vector<PartyBotGroundDanger>& dangers) const
+{
+    // Burning already.
+    std::list<WorldObject*> objects;
+    PartyBotHostileGroundCheck check(me, PB_FIRE_SEARCH_RANGE);
+    MaNGOS::WorldObjectListSearcher<PartyBotHostileGroundCheck> searcher(objects, check);
+    Cell::VisitGridObjects(me, searcher, PB_FIRE_SEARCH_RANGE);
+    for (auto const pObject : objects)
+    {
+        DynamicObject const* pDyn = static_cast<DynamicObject const*>(pObject);
+        SpellEntry const* pSpell = sSpellMgr.GetSpellEntry(pDyn->GetSpellId());
+        dangers.push_back({ pDyn->GetPositionX(), pDyn->GetPositionY(), pDyn->GetPositionZ(), pDyn->GetRadius(),
+            pDyn->GetDuration(), pSpell ? pSpell->SpellName[0] : "ground fire", false });
+    }
+
+    // About to land: enemy ground spells being cast (landing spot fixed at cast start).
+    std::list<Unit*> enemies;
+    me->GetEnemyListInRadiusAround(me, PB_FIRE_SEARCH_RANGE, enemies);
+    for (auto const pEnemy : enemies)
+    {
+        Spell const* pCast = pEnemy->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        if (!pCast || pCast->getState() != SPELL_STATE_PREPARING ||
+            !(pCast->m_targets.m_targetMask & TARGET_FLAG_DEST_LOCATION))
+            continue;
+        float const radius = GetGroundDamageRadius(pCast->m_spellInfo);
+        if (radius <= 0.0f)
+            continue;
+        dangers.push_back({ pCast->m_targets.m_destX, pCast->m_targets.m_destY, pCast->m_targets.m_destZ, radius,
+            pCast->GetCastedTime(), pCast->m_spellInfo->SpellName[0], true });
+    }
+}
+
+PartyBotGroundDanger const* PartyBotAI::GetGroundDangerAt(std::vector<PartyBotGroundDanger> const& dangers,
+    float x, float y, float z, float margin) const
+{
+    for (auto const& danger : dangers)
+    {
+        float const dx = x - danger.x;
+        float const dy = y - danger.y;
+        float const dz = z - danger.z;
+        float const reach = danger.radius + me->GetObjectBoundingRadius() + margin;
+        if (dx * dx + dy * dy + dz * dz < reach * reach)
+            return &danger;
+    }
+    return nullptr;
+}
+
+// Role reach from an escape spot: healers keep every live slotted tank in heal range and sight,
+// ranged damage dealers their target within PB_FIRE_RANGED_REACH and sight.
+bool PartyBotAI::IsGoodFireEscapeSpot(float x, float y, float z) const
+{
+    if (m_role == ROLE_HEALER)
+    {
+        for (auto const& itr : GetTankSlots())
+            if (Player const* pTank = ObjectAccessor::FindPlayer(itr.first))
+                if (pTank->IsAlive() && pTank->IsInMap(me) &&
+                   (pTank->GetDistance(x, y, z) > HEAL_TARGET_RANGE || !pTank->IsWithinLOS(x, y, z)))
+                    return false;
+        return true;
+    }
+    if (m_role == ROLE_RANGE_DPS)
+        if (Unit const* pVictim = me->GetVictim())
+            return pVictim->GetDistance(x, y, z) <= PB_FIRE_RANGED_REACH && pVictim->IsWithinLOS(x, y, z);
+    return true;
+}
+
+bool PartyBotAI::UpdateGroundFire()
+{
+    // Melee damage dealers stay on the boss (the tank walks it out of the fire). The kiter is left out
+    // while taking the boss, running out, waiting and feigning (not on the way back).
+    if (!me->IsAlive() || m_role == ROLE_MELEE_DPS ||
+       (m_kitePhase != PB_KITE_NONE && m_kitePhase != PB_KITE_BACK && m_kitePhase != PB_KITE_RETURN) ||
+        me->HasUnitState(UNIT_STATE_CAN_NOT_MOVE | UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+    {
+        m_fireDodging = false;
+        return false;
+    }
+
+    // Walking out: let it finish.
+    if (m_fireDodging)
+    {
+        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE &&
+            WorldTimer::getMSTimeDiffToNow(m_fireDodgeTime) < PB_FIRE_DODGE_MAX_TIME)
+            return true;
+        m_fireDodging = false;
+    }
+
+    if (!me->IsInCombat() && !m_groupFighting)
+        return false;
+
+    std::vector<PartyBotGroundDanger> dangers;
+    CollectGroundDangers(dangers);
+    PartyBotGroundDanger const* pFire = GetGroundDangerAt(dangers, me->GetPositionX(), me->GetPositionY(),
+        me->GetPositionZ(), 0.0f);
+
+    // A tank holding its target walks it out: fire on the tank or on the target (landing or burning)
+    // -> the tank steps so far out that the target, following into melee, stands outside too.
+    Unit* pHeld = m_role == ROLE_TANK && me->GetVictim() && me->GetVictim()->GetVictim() == me ? me->GetVictim() : nullptr;
+    if (!pFire && pHeld)
+        pFire = GetGroundDangerAt(dangers, pHeld->GetPositionX(), pHeld->GetPositionY(), pHeld->GetPositionZ(), 0.0f);
+    if (!pFire)
+    {
+        // Ranged / healers: a running chase stops while fire is near (MayChase blocks new ones).
+        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE && !MayChase(me->GetVictim()))
+        {
+            me->StopMoving();
+            me->GetMotionMaster()->Clear(false, true);
+            me->GetMotionMaster()->MoveIdle();
+        }
+        return false;
+    }
+
+    // Straight out from the fire centre (away from the own target when standing on the centre),
+    // then up to 180 degrees to either side.
+    float baseAngle;
+    if (me->GetDistance2d(pFire->x, pFire->y) > 0.5f)
+        baseAngle = std::atan2(me->GetPositionY() - pFire->y, me->GetPositionX() - pFire->x);
+    else if (Unit const* pVictim = me->GetVictim())
+        baseAngle = pVictim->GetAngle(me);
+    else
+        baseAngle = me->GetOrientation() + M_PI_F;
+
+    std::list<Unit*> enemies;
+    me->GetEnemyListInRadiusAround(me, PB_FIRE_SEARCH_RANGE, enemies);
+    Unit const* pSightAnchor = me->GetVictim() ? me->GetVictim() : me;
+    float const distance = pFire->radius + me->GetObjectBoundingRadius() + PB_FIRE_STEP_OUT +
+        (pHeld ? pHeld->GetCombatReach() : 0.0f);
+    static float const offsets[] = { 0.0f, M_PI_F / 6, -M_PI_F / 6, M_PI_F / 3, -M_PI_F / 3, M_PI_F / 2, -M_PI_F / 2,
+        2 * M_PI_F / 3, -2 * M_PI_F / 3, M_PI_F };
+    bool found = false;
+    bool roleKept = false;
+    float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f;
+    for (float offset : offsets)
+    {
+        float const angle = baseAngle + offset;
+        float x = pFire->x + distance * std::cos(angle);
+        float y = pFire->y + distance * std::sin(angle);
+        float z = me->GetPositionZ();
+        me->UpdateAllowedPositionZ(x, y, z);
+        if (GetGroundDangerAt(dangers, x, y, z, PB_FIRE_SPOT_MARGIN) || !me->IsWithinLOS(x, y, z) ||
+            !IsSafeStepBackSpot(pSightAnchor, x, y, z, enemies))
+            continue;
+        bool const good = IsGoodFireEscapeSpot(x, y, z);
+        if (!found || (good && !roleKept))
+        {
+            bestX = x; bestY = y; bestZ = z;
+            found = true;
+            roleKept = good;
+        }
+        if (good)
+            break;
+    }
+
+    char when[48];
+    if (pFire->landing)
+        snprintf(when, sizeof(when), "landing in %.1f s", pFire->timeLeft / 1000.0f);
+    else
+        snprintf(when, sizeof(when), "burning, %.0f s left", pFire->timeLeft / 1000.0f);
+
+    if (!found)
+    {
+        if (!m_fireNoSpotTime || WorldTimer::getMSTimeDiffToNow(m_fireNoSpotTime) > 5000)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: in %s (%s), no safe spot to step out to, stays",
+                me->GetName(), pFire->spellName.c_str(), when);
+            m_fireNoSpotTime = WorldTimer::getMSTime();
+        }
+        return false;
+    }
+
+    if (me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+        me->InterruptSpell(CURRENT_GENERIC_SPELL);
+    if (me->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+        me->InterruptSpell(CURRENT_CHANNELED_SPELL);
+    if (me->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        me->InterruptSpell(CURRENT_AUTOREPEAT_SPELL, true);
+
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: %s%s out of %s (%s) -> %.0f yd from its centre (fire %.1f %.1f, from %.1f %.1f to %.1f %.1f)%s%s",
+        me->GetName(), pHeld ? "walks " : "steps", pHeld ? GetLogName(pHeld).c_str() : "", pFire->spellName.c_str(), when,
+        distance, pFire->x, pFire->y, me->GetPositionX(), me->GetPositionY(),
+        bestX, bestY, m_holdPosition ? ", leaves its spot" : "",
+        roleKept ? "" : (m_role == ROLE_HEALER ? ", no spot with all tanks in heal range" :
+                         m_role == ROLE_RANGE_DPS ? ", no spot in range of its target" : ""));
+    me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+    m_fireDodging = true;
+    m_fireDodgeTime = WorldTimer::getMSTime();
+    return true;
+}
+
+// Ranged damage dealers and healers do not chase (move to range or sight) while enemy ground fire
+// is within PB_FIRE_NO_CHASE_RANGE: a chase walked them back into the fire they had just left.
+bool PartyBotAI::MayChase(Unit* /*pVictim*/) const
+{
+    if ((m_role != ROLE_RANGE_DPS && m_role != ROLE_HEALER) || (!me->IsInCombat() && !m_groupFighting))
+        return true;
+    std::vector<PartyBotGroundDanger> dangers;
+    CollectGroundDangers(dangers);
+    return !GetGroundDangerAt(dangers, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ(), PB_FIRE_NO_CHASE_RANGE);
+}
+
+// Stay / move here: while the held spot burns (or fire is about to land on it), wait beside it.
+bool PartyBotAI::HoldSpotInGroundFire()
+{
+    std::vector<PartyBotGroundDanger> dangers;
+    if (me->IsInCombat() || m_groupFighting)
+        CollectGroundDangers(dangers);
+    PartyBotGroundDanger const* pFire = dangers.empty() ? nullptr :
+        GetGroundDangerAt(dangers, m_holdX, m_holdY, m_holdZ, 0.0f);
+    if (pFire)
+    {
+        if (!m_fireHoldWaitLogged)
+        {
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: waits beside its spot (%s on it, %.0f s)", me->GetName(),
+                pFire->spellName.c_str(), pFire->timeLeft / 1000.0f);
+            m_fireHoldWaitLogged = true;
+        }
+        return true;
+    }
+    if (m_fireHoldWaitLogged)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: fire on its spot is gone, returns", me->GetName());
+        m_fireHoldWaitLogged = false;
+    }
+    return false;
+}
+
+// Every tick: log entering and leaving enemy ground fire (the area aura is on the bot while inside).
+void PartyBotAI::LogGroundFireAura()
+{
+    Aura const* pFire = nullptr;
+    static AuraType const types[] = { SPELL_AURA_PERIODIC_DAMAGE, SPELL_AURA_PERIODIC_DAMAGE_PERCENT, SPELL_AURA_PERIODIC_LEECH };
+    for (AuraType const type : types)
+    {
+        for (Aura const* pAura : me->GetAurasByType(type))
+        {
+            Unit const* pCaster = pAura->GetCaster();
+            if (pAura->IsPersistent() && pCaster && pCaster->IsHostileTo(me))
+            {
+                pFire = pAura;
+                break;
+            }
+        }
+        if (pFire)
+            break;
+    }
+
+    if (pFire && !m_inFireLogged)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: burns in %s (standing in ground fire at %.1f %.1f%s)", me->GetName(),
+            pFire->GetSpellProto()->SpellName[0].c_str(), me->GetPositionX(), me->GetPositionY(),
+            m_fireDodging ? ", stepping out" : "");
+        m_inFireLogged = true;
+        m_inFireTime = WorldTimer::getMSTime();
+    }
+    else if (!pFire && m_inFireLogged)
+    {
+        sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Move] %s: out of ground fire after %.1f s", me->GetName(),
+            WorldTimer::getMSTimeDiffToNow(m_inFireTime) / 1000.0f);
+        m_inFireLogged = false;
     }
 }
 
@@ -2668,6 +3006,10 @@ void PartyBotAI::SetHoldSpotHere()
 // Returns true while the bot is walking back to its held spot.
 bool PartyBotAI::ReturnToHoldSpot()
 {
+    // F6: the spot burns (or fire is about to land on it): wait beside it.
+    if (HoldSpotInGroundFire())
+        return false;
+
     if (me->GetMapId() != m_holdMapId)
     {
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Brain] %s: left the map of its spot, holding here", me->GetName());
@@ -2718,7 +3060,7 @@ bool PartyBotAI::ReturnToHoldSpot()
 
     if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
     {
-        me->GetMotionMaster()->MovePoint(0, m_holdX, m_holdY, m_holdZ, MOVE_PATHFINDING);
+        me->GetMotionMaster()->MovePoint(0, m_holdX, m_holdY, m_holdZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
     }
 
     return true;
@@ -3377,7 +3719,8 @@ bool PartyBotAI::TauntIfAllowed(Unit* pEnemy, PartyBotTankSlotMap const& slots, 
     for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr != nullptr; itr = itr->next())
     {
         Player* pOther = itr->getSource();
-        if (!pOther || pOther == me || pOther->GetVictim() != pEnemy)
+        if (!pOther || pOther == me || pOther->GetVictim() != pEnemy || !pOther->IsAlive() ||
+            pOther->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
             continue;
         uint8 const otherSlot = GetSlotOf(slots, pOther);
         if (otherSlot != PB_TANK_SLOT_NONE && (mySlot == PB_TANK_SLOT_NONE || otherSlot < mySlot))
@@ -4623,6 +4966,7 @@ static char const* GetKitePhaseName(PartyBotKitePhase phase)
         case PB_KITE_END: return "end";
         case PB_KITE_FEIGN: return "feign";
         case PB_KITE_BACK: return "back";
+        case PB_KITE_RETURN: return "return";
         default: return "none";
     }
 }
@@ -4717,27 +5061,47 @@ bool PartyBotAI::IsKiteCandidate(Unit const* pBoss) const
     return path.size() >= 2 && GetKitePointDistance(pBoss, path.front()) <= PB_KITE_CLAIM_RANGE;
 }
 
+// Another group kiter already has this enemy on its kite (two kiters never take the same one).
+bool PartyBotAI::IsKitedByOtherKiter(Unit const* pEnemy) const
+{
+    Group* pGroup = me->GetGroup();
+    for (GroupReference* itr = pGroup ? pGroup->GetFirstMember() : nullptr; itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        PartyBotAI const* pAI = pMember && pMember != me ? dynamic_cast<PartyBotAI const*>(pMember->AI()) : nullptr;
+        if (pAI && pAI->m_kiter && pAI->m_kitePhase != PB_KITE_NONE && pAI->m_kiteTargetGuid == pEnemy->GetObjectGuid())
+            return true;
+    }
+    return false;
+}
+
 // .partybot kiter pull: the kiter opens on the boss itself. Returns why not, nullptr when started.
 char const* PartyBotAI::StartKitePull(Unit* pBoss)
 {
     if (m_kitePhase != PB_KITE_NONE && m_kiteTargetGuid == pBoss->GetObjectGuid())
         return nullptr;
     m_kiteReleased.erase(pBoss->GetObjectGuid());
-    if (!IsBossTarget(pBoss))
-        return "not a boss";
-    if (GetKitePathSize(me->GetMapId()) < 2)
+    std::vector<PartyBotKitePoint> const path = GetKitePath(me->GetMapId());
+    if (path.size() < 2)
         return "no kite path on this map";
-    if (!IsKiteCandidate(pBoss))
-        return "boss too far from the kite path start";
+    if (!pBoss->IsAlive() || !pBoss->IsInMap(me) || GetKitePointDistance(pBoss, path.front()) > PB_KITE_CLAIM_RANGE)
+        return "too far from the kite path start";
     if (m_kitePhase != PB_KITE_NONE)
         EndKite("new kiter pull");
 
     m_kiteTargetGuid = pBoss->GetObjectGuid();
     m_kiteIndex = -1;
     m_kiteDistracted = false;
+    m_kiteOpened = false;
+    m_kiteRangeTrim = 0.0f;
+    m_kiteAtStart = false;
+    m_kiteReturnMapId = me->GetMapId();
+    m_kiteReturnX = me->GetPositionX();
+    m_kiteReturnY = me->GetPositionY();
+    m_kiteReturnZ = me->GetPositionZ();
     SetKitePhase(PB_KITE_TAKE);
-    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: opens on %s (kiter pull, %.0f yd)", me->GetName(),
-        GetLogName(pBoss).c_str(), me->GetDistance(pBoss));
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: opens on %s (kiter pull, %.0f yd, pull spot %.1f %.1f)", me->GetName(),
+        GetLogName(pBoss).c_str(), me->GetDistance(pBoss), m_kiteReturnX, m_kiteReturnY);
     SayInParty(std::string("Pulling and kiting ") + pBoss->GetName() + ".");
     WakeUp();
     return nullptr;
@@ -4779,7 +5143,7 @@ void PartyBotAI::EndKite(char const* why)
     Unit* pBoss = me->GetMap()->GetUnit(m_kiteTargetGuid);
     sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: kite over (%s, step %s, boss %s)", me->GetName(), why,
         GetKitePhaseName(m_kitePhase), pBoss ? GetLogName(pBoss).c_str() : "gone");
-    if (m_kitePhase == PB_KITE_OUT || m_kitePhase == PB_KITE_BACK)
+    if (m_kitePhase == PB_KITE_OUT || m_kitePhase == PB_KITE_BACK || m_kitePhase == PB_KITE_RETURN)
     {
         me->StopMoving();
         me->GetMotionMaster()->Clear(false, true);
@@ -4825,7 +5189,29 @@ void PartyBotAI::UpdateKiteMovement()
         return;
     }
 
-    if ((m_kitePhase != PB_KITE_OUT && m_kitePhase != PB_KITE_BACK) || m_kiteIndex < 0 ||
+    if (m_kitePhase == PB_KITE_RETURN)
+    {
+        if (m_fireDodging || me->HasUnitState(UNIT_STATE_CAN_NOT_MOVE | UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+            return;
+        if (me->GetMapId() != m_kiteReturnMapId ||
+            me->GetDistance(m_kiteReturnX, m_kiteReturnY, m_kiteReturnZ, SizeFactor::None) < PB_KITE_POINT_REACHED)
+        {
+            EndKite("back at the pull spot");
+            WakeUp();
+            return;
+        }
+        if (WorldTimer::getMSTimeDiffToNow(m_kitePhaseTime) > PB_KITE_RETURN_TIMEOUT)
+        {
+            EndKite("pull spot not reached in time");
+            WakeUp();
+            return;
+        }
+        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            me->GetMotionMaster()->MovePoint(0, m_kiteReturnX, m_kiteReturnY, m_kiteReturnZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return;
+    }
+
+    if ((m_kitePhase != PB_KITE_OUT && m_kitePhase != PB_KITE_BACK) || m_kiteIndex < 0 || m_fireDodging ||
         me->HasUnitState(UNIT_STATE_CAN_NOT_MOVE | UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
         return;
 
@@ -4874,7 +5260,7 @@ void PartyBotAI::UpdateKiteMovement()
         }
         if (m_kitePhase == PB_KITE_BACK && m_kiteIndex == 0)
         {
-            EndKite("back at the path start");
+            StartKiteReturn();
             WakeUp();
             return;
         }
@@ -4906,6 +5292,29 @@ void PartyBotAI::StartKiteRunOut(Unit* pBoss, char const* why)
     UpdateKiteMovement();
 }
 
+// Path start reached on the way back: an own move-here spot wins (ReturnToHoldSpot walks there);
+// else walk to the spot the kiter stood on when the kite began. There the kite ends and the hunter
+// fights freely (normal shooting range, steps back if the boss comes close).
+void PartyBotAI::StartKiteReturn()
+{
+    if (m_holdPosition)
+    {
+        EndKite("back at the path start, to its own spot");
+        return;
+    }
+    if (m_kiteReturnMapId != me->GetMapId() ||
+        me->GetDistance(m_kiteReturnX, m_kiteReturnY, m_kiteReturnZ, SizeFactor::None) < PB_KITE_POINT_REACHED)
+    {
+        EndKite("back at the path start (= pull spot)");
+        return;
+    }
+    sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: back at the path start, walks to its pull spot (%.1f %.1f, %.0f yd)",
+        me->GetName(), m_kiteReturnX, m_kiteReturnY,
+        me->GetDistance(m_kiteReturnX, m_kiteReturnY, m_kiteReturnZ, SizeFactor::None));
+    SetKitePhase(PB_KITE_RETURN);
+    me->GetMotionMaster()->MovePoint(0, m_kiteReturnX, m_kiteReturnY, m_kiteReturnZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+}
+
 // Returns true while the kite runs (the rest of the AI update is skipped).
 bool PartyBotAI::UpdateKite()
 {
@@ -4916,10 +5325,12 @@ bool PartyBotAI::UpdateKite()
     bool const bossThere = pBoss && pBoss->IsAlive() && pBoss->IsInCombat() &&
         !(pBoss->ToCreature() && pBoss->ToCreature()->IsInEvadeMode());
 
-    if (m_kitePhase == PB_KITE_TAKE && pBoss && pBoss->IsAlive() && !pBoss->IsInCombat())
+    if (pBoss && pBoss->IsAlive() && !pBoss->IsInCombat() &&
+       (m_kitePhase == PB_KITE_TAKE ||
+       (m_kitePhase == PB_KITE_OUT && WorldTimer::getMSTimeDiffToNow(m_kitePhaseTime) < PB_KITE_OUT_GRACE)))
     {
-        // Opening (kiter pull): the boss is not fighting yet.
-        if (WorldTimer::getMSTimeDiffToNow(m_kitePhaseTime) > PB_KITE_OPEN_TIMEOUT)
+        // Opening (kiter pull) or just ran off: the boss is not fighting yet.
+        if (m_kitePhase == PB_KITE_TAKE && WorldTimer::getMSTimeDiffToNow(m_kitePhaseTime) > PB_KITE_OPEN_TIMEOUT)
         {
             EndKite("could not open on the boss in time");
             return false;
@@ -4952,7 +5363,7 @@ bool PartyBotAI::UpdateKite()
             if (!pMember || !pMember->IsInMap(me))
                 continue;
             for (auto const pAttacker : pMember->GetAttackers())
-                if (IsKiteCandidate(pAttacker))
+                if (IsKiteCandidate(pAttacker) && !IsKitedByOtherKiter(pAttacker))
                 {
                     pBoss = pAttacker;
                     break;
@@ -4977,6 +5388,13 @@ bool PartyBotAI::UpdateKite()
         m_kiteTargetGuid = pBoss->GetObjectGuid();
         m_kiteIndex = -1;
         m_kiteDistracted = false;
+        m_kiteOpened = false;
+        m_kiteRangeTrim = 0.0f;
+        m_kiteAtStart = true; // the boss already fights: no walk to the path start
+        m_kiteReturnMapId = me->GetMapId();
+        m_kiteReturnX = me->GetPositionX();
+        m_kiteReturnY = me->GetPositionY();
+        m_kiteReturnZ = me->GetPositionZ();
         SetKitePhase(PB_KITE_TAKE);
         sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: takes %s (on %s, %.0f yd; path %u points)", me->GetName(),
             GetLogName(pBoss).c_str(), pBoss->GetVictim() ? pBoss->GetVictim()->GetName() : "nobody",
@@ -4986,6 +5404,9 @@ bool PartyBotAI::UpdateKite()
 
     if (m_kitePhase == PB_KITE_FEIGN)
         return true; // lying still (UpdateKiteMovement gets up)
+
+    if (m_kitePhase == PB_KITE_RETURN)
+        return true; // walking to the pull spot (UpdateKiteMovement)
 
     if (m_kitePhase == PB_KITE_BACK)
     {
@@ -5056,7 +5477,17 @@ bool PartyBotAI::UpdateKite()
 
     if (m_kitePhase == PB_KITE_OUT)
     {
-        // Running without stopping (UpdateKiteMovement); instant shots only.
+        // Running without stopping (UpdateKiteMovement); instant shots only: Distracting Shot right
+        // after the opener and whenever the boss is on someone else, else Arcane Shot.
+        if ((!m_kiteDistracted || !onMe) && m_spells.hunter.pDistractingShot &&
+            CanTryToCastSpell(pBoss, m_spells.hunter.pDistractingShot) &&
+            DoCastSpell(pBoss, m_spells.hunter.pDistractingShot) == SPELL_CAST_OK)
+        {
+            m_kiteDistracted = true;
+            sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: Distracting Shot on the run (boss on %s, %.0f yd)", me->GetName(),
+                pBoss->GetVictim() ? pBoss->GetVictim()->GetName() : "nobody", me->GetDistance(pBoss));
+            return true;
+        }
         if (m_spells.hunter.pArcaneShot && CanTryToCastSpell(pBoss, m_spells.hunter.pArcaneShot))
             DoCastSpell(pBoss, m_spells.hunter.pArcaneShot);
         return true;
@@ -5075,24 +5506,57 @@ bool PartyBotAI::UpdateKite()
         return true;
     }
 
-    // Take: into shooting range, Distracting Shot, then shots.
+    // Kiter pull: first to the path start (the user's chosen spot), then open from there.
+    if (!m_kiteAtStart && !pBoss->IsInCombat())
+    {
+        std::vector<PartyBotKitePoint> const path = GetKitePath(me->GetMapId());
+        if (!path.empty() && GetKitePointDistance(me, path.front()) >= PB_KITE_POINT_REACHED)
+        {
+            if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: walks to the kite path start (%.0f yd)", me->GetName(),
+                    GetKitePointDistance(me, path.front()));
+                me->GetMotionMaster()->MovePoint(0, path.front().x, path.front().y, path.front().z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            }
+            return true;
+        }
+        m_kiteAtStart = true;
+        me->StopMoving();
+        me->GetMotionMaster()->Clear(false, true);
+        me->GetMotionMaster()->MoveIdle();
+    }
+
+    // Take: opener from as far as possible (Conflagration and Flamestrike reach 30 yd): cast from where
+    // the hunter stands when in range, else walk in only as far as needed, a few yards at a time.
     me->SetFacingToObject(pBoss);
     SpellEntry const* pShot = GetRangedWeaponSpell();
     float const range = pShot ? Spells::GetSpellMaxRange(sSpellRangeStore.LookupEntry(pShot->rangeIndex)) : 30.0f;
-    if (WalkIntoRange(pBoss, range, "Kite", "shots", PB_KITE_OPEN_MARGIN))
-        return true;
-
-    // Opener on a boss not fighting yet: Aimed Shot (3 s cast; Arcane Shot without it).
-    if (!pBoss->IsInCombat())
+    if (!pBoss->IsInCombat() && !m_kiteOpened)
     {
-        SpellEntry const* pOpener = m_spells.hunter.pAimedShot && CanTryToCastSpell(pBoss, m_spells.hunter.pAimedShot) ?
+        SpellEntry const* pOpener = m_spells.hunter.pAimedShot && me->IsSpellReady(m_spells.hunter.pAimedShot) ?
             m_spells.hunter.pAimedShot : m_spells.hunter.pArcaneShot;
-        if (pOpener && CanTryToCastSpell(pBoss, pOpener) && DoCastSpell(pBoss, pOpener) == SPELL_CAST_OK)
+        SpellCastResult const result = pOpener ? DoCastSpell(pBoss, pOpener) : SPELL_FAILED_ERROR;
+        if (result == SPELL_CAST_OK)
         {
+            m_kiteOpened = true;
             sLog.Out(LOG_PLAYERBOTS, LOG_LVL_BASIC, "[Kite] %s: opens with %s on %s (%.0f yd)", me->GetName(),
                 pOpener->SpellName[0].c_str(), GetLogName(pBoss).c_str(), me->GetDistance(pBoss));
             return true;
         }
+        if (result == SPELL_FAILED_OUT_OF_RANGE || result == SPELL_FAILED_LINE_OF_SIGHT)
+        {
+            // Not in reach yet: walk in (1 yd inside range); still not in reach there: 3 yd closer.
+            if (!WalkIntoRange(pBoss, range - m_kiteRangeTrim, "Kite", "shots", 1.0f))
+                m_kiteRangeTrim += 3.0f;
+        }
+        return true;
+    }
+
+    // Opener cast: run at once (the boss follows the shot); Distracting Shot goes out on the run.
+    if (m_kiteOpened)
+    {
+        StartKiteRunOut(pBoss, "opener cast");
+        return true;
     }
 
     // Distracting Shot right after the opener, then whenever the boss is on someone else.
@@ -5159,7 +5623,7 @@ bool PartyBotAI::HunterStepBack(Unit* pVictim)
         m_stepBackFailGuid.Clear();
         if (me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
             me->InterruptSpell(CURRENT_GENERIC_SPELL);
-        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING);
+        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
         return true;
     }
 

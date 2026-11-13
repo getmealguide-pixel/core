@@ -1509,19 +1509,26 @@ bool ChatHandler::HandlePartyBotKiterPullHelper()
         return false;
     }
 
+    // The first free kiter (several kiters share the map's kite path, one enemy each).
     PartyBotAI* pKiterAI = nullptr;
     Player* pKiter = nullptr;
+    bool anyKiter = false;
     for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr && !pKiterAI; itr = itr->next())
         if (Player* pMember = itr->getSource())
             if (PartyBotAI* pAI = dynamic_cast<PartyBotAI*>(pMember->AI()))
                 if (pAI->IsKiter() && pMember->IsAlive())
                 {
-                    pKiterAI = pAI;
-                    pKiter = pMember;
+                    anyKiter = true;
+                    if (pAI->IsKiteIdle())
+                    {
+                        pKiterAI = pAI;
+                        pKiter = pMember;
+                    }
                 }
     if (!pKiterAI)
     {
-        SendSysMessage("No kiter: click your hunter bot and type .partybot kiter on");
+        SendSysMessage(anyKiter ? "All kiters are busy kiting. Set another hunter with .partybot kiter on" :
+            "No kiter: click your hunter bot and type .partybot kiter on");
         SetSentErrorMessage(true);
         return false;
     }

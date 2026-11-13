@@ -158,6 +158,7 @@ public:
     uint8 GetHighestHonorRankFromEquippedItems() const;
     void UpdateVisualHonorRankBasedOnItems();
     void BeginChasing(Unit* pVictim) const;
+    virtual bool MayChase(Unit* /*pVictim*/) const { return true; } // F6: party bots, ground fire near
     // False while a higher-priority order (e.g. "stay") forbids the bot from moving on its own.
     virtual bool CanMoveOnOwn() const { return true; }
     // Healing order among injured group members: higher first (e.g. main tank 2, off-tanks 1).

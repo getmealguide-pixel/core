@@ -3747,7 +3747,7 @@ void CombatBotBaseAI::UpdateVisualHonorRankBasedOnItems()
 
 void CombatBotBaseAI::BeginChasing(Unit* pVictim) const
 {
-    if (!CanMoveOnOwn())
+    if (!CanMoveOnOwn() || !MayChase(pVictim))
         return;
 
     if ((m_role == ROLE_RANGE_DPS || m_role == ROLE_HEALER) &&
